@@ -1,0 +1,627 @@
+function rpcError(message) {
+  return String(message).startsWith('AI_UNCONFIGURED:')
+    ? Object.assign(Error(''), { code: 'AI_UNCONFIGURED' })
+    : Error(message);
+}
+let uiReady = false;
+let seq = 0;
+const pending = new Map();
+function rpcRaw(method, params = {}) {
+  return new Promise((resolve, reject) => {
+    const id = ++seq;
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(Error('请求超时，请查看日志；不要重复提交同一操作。'));
+    }, 300000);
+    pending.set(id, { resolve, reject, timer });
+    window.ipc.postMessage(JSON.stringify({ id, method, params }));
+  });
+}
+window.receive = (v) => {
+  const p = pending.get(v.id);
+  if (!p) return;
+  clearTimeout(p.timer);
+  pending.delete(v.id);
+  v.ok ? p.resolve(v.data) : p.reject(rpcError(v.error));
+};
+window.chrome?.webview?.addEventListener('message', (event) => window.receive(event.data));
+const longAiMethods = new Set([
+  'tool_test',
+  'scan',
+  'analyze',
+  'advice_feedback',
+  'schedule_format',
+  'edit_ai',
+  'report',
+  'archive',
+  'learn',
+  'source_range',
+  'prompt_retry',
+]);
+async function rpc(method, params = {}) {
+  if (!longAiMethods.has(method)) return rpcRaw(method, params);
+  const accepted = await rpcRaw('ai_job_start', { method, params });
+  for (;;) {
+    let result;
+    try {
+      result = await rpcRaw('ai_job_result', { job_id: accepted.job_id });
+    } catch (error) {
+      throw Error(`查询后台操作 ${accepted.job_id} 失败：${error.message}；后台可能仍在执行，请查看状态与日志。`);
+    }
+    if (result.done) {
+      if (!result.ok) throw rpcError(result.error);
+      return result.data;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 750));
+  }
+}
+const $ = (s) => document.querySelector(s);
+const esc = (s) =>
+  String(s ?? '').replace(
+    /[&<>"']/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c],
+  );
+function aiModelLabel(detail) {
+  return `${detail.source.label} · ${detail.source.model_name || '默认模型'}`;
+}
+const aiLiveSpeedTip = '最近 1 秒 API 已上报输出 tokens 的增量；每秒计算一次。';
+const aiSpeedTip =
+  'DSH 均值：已完成且有用量与时间记录的步骤，其输出 tokens 总数 ÷ 首个输出到结束的耗时总和；排除首次输出前的等待、工具及本地校验时间。';
+const liveTokenSample = {};
+function tokenSpeed(output, elapsed) {
+  const rate =
+    Number.isFinite(output) && output >= 0 && Number.isFinite(elapsed) && elapsed > 0 ? (output * 1000) / elapsed : NaN;
+  return Number.isFinite(rate)
+    ? rate.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 })
+    : '—';
+}
+function generationSpeed(stats) {
+  const value = stats?.steps > 0 ? tokenSpeed(stats.output_tokens, stats.elapsed_ms) : '—';
+  return {
+    known: value !== '—',
+    average: true,
+    text: value === '—' ? '' : value + ' tokens/s',
+    tip: aiSpeedTip,
+  };
+}
+function requestMetrics(requestId = '') {
+  const live = state?.ai_live,
+    liveMatches = live && (!requestId || live.request_id === requestId);
+  if (state?.ai_busy && liveMatches) return { generation: live.generation, first: live.first_response_ms };
+  const terminal = (state?.activity || []).find(
+    (a) =>
+      ['ai_success', 'ai_failed', 'ai_cancelled'].includes(a.kind) &&
+      (!requestId || a.detail?.request_id === requestId),
+  );
+  if (terminal) {
+    const d = terminal.detail;
+    return { generation: d.generation, first: d.first_response_ms };
+  }
+  return liveMatches ? { generation: live.generation, first: live.first_response_ms } : {};
+}
+function sampleTokenRate(sample, key, count, at) {
+  if (
+    sample.key !== key ||
+    !Number.isFinite(count) ||
+    count < 0 ||
+    !Number.isFinite(sample.count) ||
+    count < sample.count ||
+    at < sample.at
+  ) {
+    Object.assign(sample, {
+      key,
+      count: Number.isFinite(count) && count >= 0 ? count : null,
+      at,
+      rate: null,
+    });
+    return null;
+  }
+  const elapsed = at - sample.at;
+  if (elapsed >= 1000) {
+    sample.rate = elapsed <= 1500 ? ((count - sample.count) * 1000) / elapsed : null;
+    sample.count = count;
+    sample.at = at;
+  }
+  return sample.rate;
+}
+function requestSpeed(requestId = '') {
+  const live = state?.ai_live;
+  if (state?.ai_busy && live && (!requestId || live.request_id === requestId)) {
+    const key = live.request_id + ':' + (state.ai_started || 0),
+      at = Date.now();
+    if (liveTokenSample.key !== key) Object.assign(liveTokenSample, { key, api: {}, shown: false });
+    if (!Number.isFinite(live.first_response_ms))
+      return { known: false, average: false, text: '', tip: aiLiveSpeedTip };
+    const api = liveTokenSample.api,
+      previousAt = api.at,
+      apiRate = sampleTokenRate(api, key, live.usage_final ? null : live.output_tokens, at);
+    if (api.at !== previousAt) {
+      const reported = live.usage_elapsed_ms;
+      api.fresh = Number.isFinite(api.reported) && reported > api.reported && reported - api.reported <= 1500;
+      api.reported = Number.isFinite(live.output_tokens) && !live.usage_final ? reported : null;
+    }
+    if (Number.isFinite(apiRate) && api.fresh) {
+      liveTokenSample.shown = true;
+      return {
+        known: true,
+        average: false,
+        text: tokenSpeed(apiRate, 1000) + ' tokens/s',
+        tip: aiLiveSpeedTip,
+      };
+    }
+    const mean = generationSpeed(live.generation);
+    if (mean.known) {
+      liveTokenSample.shown = true;
+      return mean;
+    }
+    return {
+      known: liveTokenSample.shown,
+      average: false,
+      text: liveTokenSample.shown ? '0.0 tokens/s' : '',
+      tip: aiLiveSpeedTip,
+    };
+  }
+  return generationSpeed(requestMetrics(requestId).generation);
+}
+function firstResponseLabel(value) {
+  return Number.isFinite(value) && value >= 0
+    ? value < 1000
+      ? value.toLocaleString('en-US') + ' ms'
+      : (value / 1000).toLocaleString('en-US', {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        }) + ' s'
+    : '—';
+}
+function analysisProgressText() {
+  const live = state?.ai_live,
+    text = (live?.entries || []).at(-1)?.text || live?.phase || state?.ai_progress || '正在连接，等待公开内容';
+  return (
+    Array.from(
+      String(text)
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .at(-1) || '',
+    )
+      .slice(-260)
+      .join('') || '等待公开内容'
+  );
+}
+const date = (t) =>
+  t ? new Date(t).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '尚未扫描';
+let state = null,
+  page = 'tasks',
+  selected = '',
+  tab = '待处理',
+  query = '',
+  inboxQuery = '',
+  settingsDirty = false,
+  modalTask = null,
+  manualSources = [],
+  toastTimer,
+  modalFromTrace = false;
+const names = {
+  tasks: '事项',
+  review: '回顾',
+  schedules: '回顾',
+  inbox: '消息',
+  tools: '工具',
+  reports: '回顾',
+  learning: '回顾',
+  logs: '系统日志',
+  settings: '设置',
+  sources: '消息来源',
+  guide: '使用说明',
+};
+function toast(s) {
+  if (!s) return;
+  $('#toast').textContent = s;
+  $('#toast').hidden = false;
+  clearTimeout(toastTimer);
+  motionAnimate($('#toast'), [{ opacity: 0.3 }, { opacity: 1 }]);
+  toastTimer = setTimeout(() => motionHide($('#toast')), 6000);
+}
+function dueLabel(t) {
+  if (!t.due) return '';
+  const d = new Date(t.due);
+  if (!Number.isFinite(d.getTime())) return t.due;
+  if (!deadlineActive(t)) return '截止 ' + date(d.getTime());
+  const hours = (d - Date.now()) / 3600000;
+  return (hours < 0 ? '已逾期 · ' : hours < 24 ? '即将截止 · ' : '截止 ') + date(d.getTime());
+}
+function deadlineActive(t) {
+  return ['待处理', '处理中'].includes(t.status) && !t.archived && !t.merged_into;
+}
+function isOverdue(t) {
+  return deadlineActive(t) && Boolean(t.due) && new Date(t.due).getTime() < Date.now();
+}
+function localDue(d) {
+  return d ? new Date(new Date(d).getTime() + 8 * 3600000).toISOString().slice(0, 16) : '';
+}
+function badge(p) {
+  return `<span class="badge ${p === '紧急' ? 'urgent' : p === '高' ? 'high' : p === '已完成' ? 'green' : p === '普通' ? 'normal' : p === '低' ? 'low' : ''}">${esc(p)}</span>`;
+}
+function empty(title, text, button = '') {
+  return `<div class="empty"><div class="empty-icon">${icon('empty')}</div><div>${title}</div><p>${text}</p>${button}</div>`;
+}
+let modalClosing = null,
+  modalOutsideDismiss = null,
+  modalBack = null,
+  modalEpoch = 0;
+function setModal(html) {
+  if (cancelEmbeddedPluginSettings?.() === false) return;
+  modalEpoch++;
+  const overlay = $('#overlay'),
+    closing = modalClosing,
+    opacity = getComputedStyle(overlay).opacity;
+  modalClosing = null;
+  closing?.animation.cancel();
+  overlay.inert = false;
+  delete overlay.dataset.closing;
+  modalFromTrace = false;
+  modalOutsideDismiss = null;
+  modalBack = null;
+  $('#dialog').classList.remove(
+    'wide-dialog',
+    'live-dialog',
+    'plugin-settings-dialog',
+    'plugin-settings-compact',
+    'tool-editor-dialog',
+    'tool-history-dialog',
+    'tool-detail-dialog',
+    'merge-dialog',
+  );
+  clearHtml($('#dialog'));
+  $('#dialog').innerHTML = html;
+  overlay.hidden = false;
+  if (closing) motionAnimate(overlay, [{ opacity }, { opacity: 1 }]);
+  $('#dialog').querySelector('textarea,input')?.focus({ preventScroll: true });
+  motionAnimate($('#dialog'), [
+    { opacity: 0.4, transform: 'translateY(4px)' },
+    { opacity: 1, transform: 'none' },
+  ]);
+}
+function modalReturnPoint() {
+  if ($('#overlay').hidden || modalClosing) return null;
+  const dialog = $('#dialog'),
+    nodes = [...dialog.childNodes],
+    classes = dialog.className,
+    scroll = dialog.scrollTop,
+    focused = document.activeElement,
+    task = modalTask,
+    outside = modalOutsideDismiss,
+    back = modalBack,
+    fromTrace = modalFromTrace;
+  return () => {
+    setModal('');
+    dialog.className = classes;
+    dialog.replaceChildren(...nodes);
+    modalTask = task;
+    modalOutsideDismiss = outside;
+    modalBack = back;
+    modalFromTrace = fromTrace;
+    dialog.scrollTop = scroll;
+    if (focused?.isConnected) focused.focus({ preventScroll: true });
+  };
+}
+async function copyText(text) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {}
+  const focused = document.activeElement,
+    field = document.createElement('textarea');
+  field.value = text;
+  field.readOnly = true;
+  field.style.cssText = 'position:fixed;left:-9999px;top:0';
+  document.body.append(field);
+  field.focus({ preventScroll: true });
+  field.select();
+  try {
+    return !!document.execCommand('copy');
+  } catch {
+    return false;
+  } finally {
+    field.remove();
+    if (focused?.isConnected) focused.focus({ preventScroll: true });
+  }
+}
+async function modalRequest(button, method, params, accept, { label, lockForm = false } = {}) {
+  const controls = lockForm ? [...$('#dialog').querySelectorAll('input,select,textarea,button')] : [button];
+  const previous = controls.map((control) => [control, control.disabled]);
+  const message = $('#modal-error'),
+    caption = button.textContent;
+  controls.forEach((control) => {
+    control.disabled = true;
+  });
+  button.dataset.pending = 'true';
+  if (label) {
+    button.textContent = label;
+    message.textContent = '';
+  }
+  try {
+    const result = await rpc(method, params);
+    delete button.dataset.pending;
+    await accept(result);
+  } catch (error) {
+    message.textContent = error.message;
+  } finally {
+    delete button.dataset.pending;
+    previous.forEach(([control, disabled]) => {
+      control.disabled = disabled;
+    });
+    if (label) button.textContent = caption;
+  }
+}
+function closeModal() {
+  const overlay = $('#overlay');
+  if (overlay.hidden || modalClosing || $('#dialog').querySelector('[data-pending="true"]')) return;
+  modalEpoch++;
+  if (modalBack) {
+    const back = modalBack;
+    modalBack = null;
+    back();
+    return;
+  }
+  cancelEmbeddedPluginSettings?.();
+  modalTask = null;
+  modalFromTrace = false;
+  modalOutsideDismiss = null;
+  const animation = motionAnimate(overlay, [{ opacity: getComputedStyle(overlay).opacity }, { opacity: 0 }], {
+    fill: 'forwards',
+  });
+  if (!animation) {
+    overlay.hidden = true;
+    clearHtml($('#dialog'));
+    return;
+  }
+  const closing = { animation };
+  modalClosing = closing;
+  overlay.inert = true;
+  overlay.dataset.closing = 'true';
+  animation.finished.then(
+    () => {
+      if (modalClosing !== closing) return;
+      overlay.hidden = true;
+      clearHtml($('#dialog'));
+      overlay.inert = false;
+      delete overlay.dataset.closing;
+      modalClosing = null;
+      animation.cancel();
+    },
+    () => {},
+  );
+}
+async function perform(method, params = {}, notice = '已完成') {
+  try {
+    const v = await rpc(method, params);
+    await refreshState(true);
+    if (notice) toast(notice);
+    return v;
+  } catch (e) {
+    toast(e.message);
+    throw e;
+  }
+}
+const htmlMemo = new WeakMap();
+function clearHtml(el) {
+  if (!el) return;
+  htmlMemo.get(el)?.observer.disconnect();
+  htmlMemo.delete(el);
+  el.replaceChildren();
+}
+function setHtml(selector, html, options) {
+  const el = typeof selector === 'string' ? $(selector) : selector;
+  if (!el) return;
+  let memo = htmlMemo.get(el);
+  if (!memo) {
+    memo = { dirty: true };
+    memo.observer = new MutationObserver(() => {
+      memo.dirty = true;
+    });
+    memo.observer.observe(el, { subtree: true, childList: true, attributes: true, characterData: true });
+    htmlMemo.set(el, memo);
+  }
+  // takeRecords also sees mutations made synchronously before this call.
+  if (memo.observer.takeRecords().length) memo.dirty = true;
+  if (memo.input === html && !memo.dirty) return;
+  reconcileHtml(el, html, options);
+  memo.observer.takeRecords();
+  memo.input = html;
+  memo.dirty = false;
+}
+let refreshInFlight = null,
+  refreshForced = false,
+  refreshQueued = false,
+  renderedPage = '',
+  renderedKey = '',
+  renderEpoch = 0,
+  pluginCatalogRevision = 0;
+function viewKey(s, p) {
+  switch (p) {
+    case 'tasks':
+      return JSON.stringify([
+        s.tag_state,
+        (s.handling || []).map((r) => [r.id, r.task_id, r.status]),
+        s.tasks,
+        s.task_history_revision,
+        s.tasks_revision,
+        s.task_focus_counts,
+        s.last_analysis_success_at,
+        s.usage.day,
+        s.pending,
+        s.config.enabled,
+        s.config.tools,
+        s.ai_busy,
+        s.busy,
+      ]);
+    case 'inbox':
+      return JSON.stringify([
+        s.messages_revision,
+        s.pending,
+        s.last_scan,
+        s.config.enabled,
+        s.config.interval_minutes,
+        s.config.message_retention_days,
+      ]);
+    case 'schedules':
+      return JSON.stringify(s.schedules);
+    case 'reports':
+      return JSON.stringify([
+        s.reports_revision,
+        s.config.work_start,
+        s.config.work_end,
+        s.archive_attempt,
+        s.report_outcome,
+      ]);
+    case 'learning':
+      return JSON.stringify([s.suggestions, s.rule_version, s.tag_state, s.evolution]);
+    case 'logs':
+      return JSON.stringify(s.activity_day_revision);
+    case 'sources':
+      return JSON.stringify([s.chat_sources, pluginCatalogRevision]);
+    case 'tools':
+      return JSON.stringify(s.config.tools);
+    case 'settings':
+      return JSON.stringify([promptSection, promptSection === 'memory' ? s.memory_state : s.prompt_state]);
+    default:
+      return '';
+  }
+}
+window.refreshState = function (force = false) {
+  if (refreshInFlight) {
+    if (force) {
+      refreshForced = true;
+      refreshQueued = true;
+    }
+    return refreshInFlight;
+  }
+  refreshForced = force;
+  refreshInFlight = (async () => {
+    do {
+      refreshQueued = false;
+      try {
+        const forced = refreshForced;
+        refreshForced = false;
+        const requestPage = page,
+          requestSelected = requestPage === 'tasks' ? selected || undefined : undefined,
+          requestLogDay = requestPage === 'logs' ? logDay || shanghaiLogDay() : undefined;
+        const next = await rpc('state', {
+          page: requestPage,
+          selected_task: requestSelected,
+          log_day: requestLogDay,
+          core_revision: !forced && state?._page === requestPage ? state.core_revision : undefined,
+        });
+        if (
+          page !== requestPage ||
+          requestSelected !== (page === 'tasks' ? selected || undefined : undefined) ||
+          requestLogDay !== (page === 'logs' ? logDay || shanghaiLogDay() : undefined)
+        ) {
+          refreshQueued = true;
+          refreshForced = true;
+          continue;
+        }
+        // An `_unchanged` snapshot carries no tag_state.
+        if (next.tag_state && JSON.stringify(next.tag_state.groups) !== JSON.stringify(state?.tag_state.groups)) {
+          selectedTags = structuredClone(next.tag_state.filters);
+          selectedPriorities = [];
+        }
+        state = next._unchanged ? { ...state, ...next } : next;
+        status();
+        syncTaskRecordPanel();
+        syncUpdateNotice();
+        syncEditProgress();
+        if (
+          page === 'settings' &&
+          $('#settings-source-content') &&
+          sourceCatalogKey !== JSON.stringify([state.chat_sources, pluginCatalogRevision])
+        )
+          void renderSources();
+        const active = document.activeElement,
+          editing =
+            $('#view').contains(active) && active?.matches('input,textarea,select') && active.id !== 'inbox-search';
+        const nextKey = !next._unchanged || page === 'logs' ? viewKey(state, page) : undefined;
+        const changed = renderedPage !== page || (nextKey !== undefined && renderedKey !== nextKey);
+        if (
+          (forced &&
+            !(
+              page === 'settings' &&
+              renderedPage === 'settings' &&
+              (settingsChanged() || settingsSavePromise || settingsQueue || connectionEditor)
+            )) ||
+          (changed && page !== 'settings' && (!editing || page === 'tasks') && !settingsDirty && $('#overlay').hidden)
+        ) {
+          const target = page,
+            scroll = $('#view').scrollTop;
+          await render(nextKey);
+          if (page === target) $('#view').scrollTop = scroll;
+        } else if (page === 'settings' && renderedPage === page && changed) await renderSystemPrompts();
+        if (!uiReady) {
+          uiReady = true;
+          await rpc('ui_ready');
+        }
+      } catch (e) {
+        toast(e.message);
+      }
+    } while (refreshQueued);
+  })().finally(() => {
+    refreshInFlight = null;
+  });
+  return refreshInFlight;
+};
+let settingsBaseline = {},
+  scanPending = false,
+  scanToggleBusy = false;
+function readSettingsValues() {
+  return Object.fromEntries(
+    [...document.querySelectorAll('#view [id^="cfg-"]')]
+      .filter((el) => el.matches('input,textarea,select'))
+      .map((el) => [
+        el.id,
+        el.type === 'checkbox'
+          ? el.disabled && el.dataset.savedChoice !== undefined
+            ? el.dataset.savedChoice === 'true'
+            : el.checked
+          : el.type === 'number'
+            ? Number(el.value)
+            : el.id === 'cfg-leaders'
+              ? el.value
+                  .split(/[\n,，]/)
+                  .map((s) => s.trim())
+                  .filter(Boolean)
+                  .join('\n')
+              : el.value.trim(),
+      ]),
+  );
+}
+function settingsChanged() {
+  if (page !== 'settings') return settingsDirty;
+  const current = readSettingsValues();
+  return Object.keys(settingsBaseline).some((id) => current[id] !== settingsBaseline[id]);
+}
+async function leaveSettings() {
+  if (memoryEditor && !leaveMemory()) return false;
+  // A busy connection editor refuses before settings are flushed.
+  if (connectionEditor?.saving || connectionEditor?.busy) return leaveConnectionEditor();
+  if (page === 'settings' && !(await flushSettings())) {
+    toast('设置尚未保存，请修正输入或重试');
+    return false;
+  }
+  if (!leaveConnectionEditor()) return false;
+  settingsDirty = false;
+  return true;
+}
+
+const effortNames = {
+  none: '无',
+  minimal: '最少',
+  low: '低',
+  medium: '中',
+  high: '高',
+  xhigh: '很高',
+  max: '最高',
+  ultra: '超高',
+};
