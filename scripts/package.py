@@ -7,6 +7,7 @@ x86_64-pc-windows-gnu (needs mingw-w64 and makensis on PATH). The installer
 contents are the explicit list in STAGE below; nothing else is shipped.
 """
 import hashlib
+import json
 import os
 import platform
 import re
@@ -40,11 +41,18 @@ def build():
     subprocess.run(cmd, cwd=ROOT, env=env, check=True)
 
 
-def loader(release):
-    found = sorted(release.glob("build/webview2-com-sys-*/out/x64/WebView2Loader.dll"))
-    if not found:
-        sys.exit("x64 WebView2Loader.dll not found under " + str(release / "build"))
-    return found[-1]
+def loader():
+    metadata = json.loads(subprocess.check_output(
+        ["cargo", "metadata", "--offline", "--locked", "--format-version", "1",
+         "--filter-platform", TRIPLE or "x86_64-pc-windows-msvc"], cwd=ROOT,
+    ))
+    packages = [p for p in metadata["packages"] if p["name"] == "webview2-com-sys"]
+    if len(packages) != 1:
+        sys.exit("Expected one resolved webview2-com-sys package")
+    dll = Path(packages[0]["manifest_path"]).parent / "x64/WebView2Loader.dll"
+    if not dll.is_file():
+        sys.exit("x64 WebView2Loader.dll missing from resolved package")
+    return dll
 
 
 def main():
@@ -57,7 +65,7 @@ def main():
     stage.mkdir(parents=True)
     files = {
         "shishi.exe": release / "shishi.exe",
-        "WebView2Loader.dll": loader(release),
+        "WebView2Loader.dll": loader(),
         "shishi.ico": ROOT / "assets/shishi.ico",
         "README.txt": ROOT / "README.txt",
         "CLI.md": ROOT / "docs/CLI.md",

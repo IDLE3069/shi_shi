@@ -27,10 +27,14 @@ fn temp_dir(label: &str) -> PathBuf {
 }
 
 /// The synthetic agent and submit server in `tests/support` are examples,
-/// which `cargo test` builds next to the test's own directory.
+/// which `cargo test` builds in the profile's examples directory.
 fn example(name: &str) -> PathBuf {
-    let deps = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
-    deps.parent().unwrap().join("examples").join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+    std::env::current_exe()
+        .unwrap()
+        .ancestors()
+        .map(|dir| dir.join("examples").join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
+        .find(|path| path.is_file())
+        .expect("compiled example not found")
 }
 
 fn mock_launch(scenario: &str) -> AcpLaunch {

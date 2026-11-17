@@ -42,8 +42,12 @@ fn store(ctx: &Ctx, tool: Value) -> Tool {
 
 /// A template calling the fixture with `steps`.
 fn fx(steps: &str) -> String {
-    let deps = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
-    let exe = deps.parent().unwrap().join("examples").join(format!("tool_fixture{}", std::env::consts::EXE_SUFFIX));
+    let exe = std::env::current_exe()
+        .unwrap()
+        .ancestors()
+        .map(|dir| dir.join("examples").join(format!("tool_fixture{}", std::env::consts::EXE_SUFFIX)))
+        .find(|path| path.is_file())
+        .expect("compiled tool_fixture not found");
     format!("\"{}\" {steps}", exe.display())
 }
 
