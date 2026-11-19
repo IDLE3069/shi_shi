@@ -531,7 +531,7 @@ impl From<Error> for Fit {
 /// The input-limit text of a request that cannot shrink below `smallest`.
 pub fn minimum_error(smallest: usize, limit: usize) -> String {
     format!(
-        "{INPUT_LIMIT_ERROR}：单条消息及必需上下文至少为 {smallest} 字符，超过上限 {limit}；本次未调用 AI，消息仍待处理。请精简配置或提高上限。"
+        "{INPUT_LIMIT_ERROR}：单条消息及必需上下文至少为 {smallest} 字，超过上限 {limit}；本次未调用 AI，消息仍待处理。请精简配置或提高上限。"
     )
 }
 
@@ -593,7 +593,7 @@ pub fn fit(
             let Some((selected, mut total)) = accepted else {
                 check()?;
                 let error = minimum_error(smallest, limit);
-                let log = json!({"selected": 1, "initial_selected": count, "total_input_chars": smallest,
+                let log = json!({"selected": 1, "initial_selected": count, "unit": "words", "total_input_chars": smallest,
                                  "max_input_chars": limit, "reason": "minimum_request_exceeds_budget"});
                 let alone = measure(0, 0, false, 0)? <= limit;
                 return Err(Fit::TooLarge { error, alone, log });
@@ -663,7 +663,7 @@ pub fn fit(
         reduced_by.push("input_budget");
     }
     payload["_batch_metrics"] = json!({
-        "selected": selected, "initial_selected": count, "max_input_chars": limit, "total_input_chars": total,
+        "selected": selected, "initial_selected": count, "max_input_chars": limit, "unit": "words", "total_input_chars": total,
         "task_limit": summaries, "omitted_tasks": directory_count - summaries,
         "unlisted_tasks": directory_count - directory, "reduced_by": reduced_by, "packing_probes": probes,
     });

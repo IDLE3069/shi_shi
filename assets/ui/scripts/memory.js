@@ -1,40 +1,36 @@
 let memoryData = null,
   memoryEditor = null,
+  memoryKind = 'temporary',
   memoryRequest = 0;
 async function renderMemory() {
   const request = ++memoryRequest,
     epoch = renderEpoch;
-  if (!memoryData)
-    setHtml('#settings-prompt-content', `<div class="memory-page">${systemPromptTabs()}<p class="helper">读取AI记忆…</p></div>`);
   const result = await rpc('memory_read');
-  if (page !== 'settings' || promptSection !== 'memory' || request !== memoryRequest || epoch !== renderEpoch) return;
+  if (page !== 'settings' || request !== memoryRequest || epoch !== renderEpoch) return;
   memoryData = result;
-  drawMemory();
+  if (!memoryEditor || !memoryEditor.saving) drawMemory();
 }
 function memoryTextCount() {
-  return [...(memoryEditor?.text || '')].length;
+  return [...memoryEditor.text].length;
 }
 function drawMemory() {
-  const edit = memoryEditor,
-    kind = edit?.kind;
-  const card = (k) => {
-    const data = memoryData[k],
-      editing = kind === k,
-      caption = k === 'temporary' ? '分析之间的交接笔记，归档时并入归档记忆后清空' : '归档时结合操作记录和临时记忆，整理长期经验和偏好',
-      text = editing ? edit.text : data.text || '',
-      count = [...text].length,
-      countLabel = `${count} / ${data.max_chars} 字符`,
-      overLimit = count > data.max_chars;
-    return `<section class="box memory-card"><div class="row memory-card-head"><div class="memory-heading"><h2>${k === 'temporary' ? '临时记忆' : '归档记忆'}</h2><span class="memory-caption" title="${caption}">${caption}</span></div>${!editing ? `<button data-memory-edit="${k}">编辑记忆</button>` : ''}</div>${editing ? `<div class="memory-editor"><label for="memory-${k}">记忆正文</label><textarea id="memory-${k}" rows="9" data-memory-text>${esc(text)}</textarea><div class="memory-editor-foot"><span id="memory-count" class="helper${overLimit ? ' memory-over-limit' : ''}">${countLabel}</span><div class="row"><button data-memory-cancel>取消</button><button class="primary" data-memory-save>保存记忆</button></div></div><p id="memory-limit" class="helper memory-over-limit"${overLimit ? '' : ' hidden'}>原内容已完整保留，请精简到 ${data.max_chars} 字符以内再保存。</p><div id="memory-error" class="error-box" role="status"></div></div>` : `<p class="memory-prose">${esc(text || (k === 'temporary' ? '还没有临时记忆，AI 会在分析时按需记录。' : '还没有归档记忆。'))}</p><p class="helper${overLimit ? ' memory-over-limit' : ''}">${countLabel}${overLimit ? ' · 原内容已完整保留，后续保存需精简。' : ''}</p>`}</section>`;
-  };
+  const data = memoryData[memoryKind],
+    text = memoryEditor ? memoryEditor.text : data.text,
+    count = [...text].length,
+    overLimit = count > data.max_chars,
+    temporary = memoryKind === 'temporary';
   setHtml(
-    '#settings-prompt-content',
-    `<div class="memory-page">${systemPromptTabs()}<div class="memory-intro"><h2>AI 记忆</h2><p>看看 AI 记住了什么，随时修正，让后续处理更贴近你的需要。</p><p class="helper">记忆只保存在本地；保存后供后续 AI 请求使用。记忆不提供版本比较或回滚。</p><button class="quiet" data-memory-reload>重新读取</button></div>${card('temporary')}${card('archived')}</div>`,
+    '#settings-memory-content',
+    `<div class="row memory-toolbar"><div class="pills" role="group" aria-label="记忆类型"><button data-memory-kind="temporary" aria-pressed="${temporary}" class="${temporary ? 'active' : ''}">临时记忆</button><button data-memory-kind="archived" aria-pressed="${!temporary}" class="${temporary ? '' : 'active'}">归档记忆</button></div>${help(temporary ? '分析之间的交接笔记，归档时并入归档记忆后清空。' : '归档时结合操作记录和临时记忆，整理长期经验和偏好。')}<span id="memory-count" class="helper${overLimit ? ' memory-over-limit' : ''}">${count} / ${data.max_chars} 字符</span>${memoryEditor ? '<button data-memory-cancel>取消</button><button class="primary" data-memory-save>保存记忆</button>' : '<button class="quiet" data-memory-reload>重新读取</button><button data-memory-edit>编辑记忆</button>'}</div><div data-preserve-content><textarea id="memory-text" aria-label="记忆正文" readonly></textarea></div><p id="memory-limit" class="helper memory-over-limit"${overLimit ? '' : ' hidden'}>原内容已完整保留，请精简到 ${data.max_chars} 字符以内再保存。</p><div id="memory-error" class="error-box" role="status"></div>`,
   );
-}
-function readMemoryDraft() {
-  if (!memoryEditor) return;
-  memoryEditor.text = $('[data-memory-text]')?.value ?? memoryEditor.text;
+  const field = $('#memory-text');
+  field.readOnly = !memoryEditor;
+  field.placeholder = temporary ? '还没有临时记忆，AI会在分析时按需记录。' : '还没有归档记忆。';
+  if (field.value !== text) {
+    const top = field.scrollTop;
+    field.value = text;
+    field.scrollTop = top;
+  }
 }
 function leaveMemory() {
   if (!memoryEditor) return true;
@@ -42,16 +38,15 @@ function leaveMemory() {
     toast('记忆正在保存，请稍候');
     return false;
   }
-  readMemoryDraft();
   if (!confirm('记忆修改尚未保存，放弃本次编辑？')) return false;
   memoryEditor = null;
   return true;
 }
 document.addEventListener('input', (e) => {
-  if (!e.target.closest('.memory-editor')) return;
-  readMemoryDraft();
+  if (e.target.id !== 'memory-text') return;
+  memoryEditor.text = e.target.value;
   const count = memoryTextCount(),
-    limit = memoryData[memoryEditor.kind].max_chars;
+    limit = memoryData[memoryKind].max_chars;
   $('#memory-count').textContent = `${count} / ${limit} 字符`;
   $('#memory-count').classList.toggle('memory-over-limit', count > limit);
   $('#memory-limit').hidden = count <= limit;
@@ -60,14 +55,18 @@ document.addEventListener('click', async (e) => {
   const b = e.target.closest('button');
   if (!b || ![...b.attributes].some((a) => a.name.startsWith('data-memory-'))) return;
   try {
+    if (b.dataset.memoryKind) {
+      if (memoryKind === b.dataset.memoryKind || !leaveMemory()) return;
+      memoryKind = b.dataset.memoryKind;
+      drawMemory();
+      $('#memory-text').scrollTop = 0;
+      return;
+    }
     if (b.hasAttribute('data-memory-edit')) {
-      if (!leaveMemory()) return;
-      const kind = b.dataset.memoryEdit,
-        data = memoryData[kind];
+      const data = memoryData[memoryKind];
       memoryEditor = {
-        kind,
         expected: data.revision,
-        text: data.text || '',
+        text: data.text,
       };
       drawMemory();
       return;
@@ -78,22 +77,21 @@ document.addEventListener('click', async (e) => {
       return;
     }
     if (b.hasAttribute('data-memory-reload')) {
-      if (!leaveMemory()) return;
       await renderMemory();
       return;
     }
-    readMemoryDraft();
     if (b.hasAttribute('data-memory-save')) {
       if (memoryEditor.saving) return;
-      const limit = memoryData[memoryEditor.kind].max_chars;
+      const limit = memoryData[memoryKind].max_chars;
       if (memoryTextCount() > limit) return;
       memoryEditor.saving = true;
       document
-        .querySelectorAll('.memory-page button,.memory-page input,.memory-page textarea')
+        .querySelectorAll('.memory-page button,.memory-page textarea')
         .forEach((el) => (el.disabled = true));
       try {
-        const { kind, expected, text } = memoryEditor,
-          result = await rpc('memory_save', { kind, expected, text });
+        const { expected, text } = memoryEditor,
+          result = await rpc('memory_save', { kind: memoryKind, expected, text });
+        ++memoryRequest;
         memoryData = result;
         memoryEditor = null;
         drawMemory();
@@ -103,7 +101,7 @@ document.addEventListener('click', async (e) => {
       } finally {
         if (memoryEditor) memoryEditor.saving = false;
         document
-          .querySelectorAll('.memory-page button,.memory-page input,.memory-page textarea')
+          .querySelectorAll('.memory-page button,.memory-page textarea')
           .forEach((el) => (el.disabled = false));
       }
     }

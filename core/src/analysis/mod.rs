@@ -121,7 +121,7 @@ pub trait Model: Send + Sync {
         if let Some(o) = payload.as_object_mut() {
             o.retain(|k, _| !k.starts_with('_'));
         }
-        let total = batch::chars(&payload);
+        let total = shishi_api::json::json_words(&payload);
         Ok(Measured::new(request, total))
     }
 

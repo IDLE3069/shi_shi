@@ -130,7 +130,7 @@ document.addEventListener('click', async (e) => {
   const b = e.target.closest('button');
   if (
     !b ||
-    !['settingsTarget', 'promptSection', 'adviceReply', 'adviceAction', 'inboxDelete', 'workflow', 'mergeSelect'].some(
+    !['settingsTarget', 'adviceReply', 'adviceAction', 'inboxDelete', 'workflow', 'mergeSelect'].some(
       (k) => b.dataset[k],
     )
   )
@@ -159,17 +159,6 @@ document.addEventListener('click', async (e) => {
         block: 'start',
         behavior: 'smooth',
       });
-      return;
-    }
-    if (b.dataset.promptSection) {
-      if (!(await leaveSettings())) return;
-      promptSection = b.dataset.promptSection === 'memory' ? 'memory' : 'history';
-      if (page === 'settings') await renderSystemPrompts();
-      else {
-        page = 'settings';
-        pendingSettingsSection = 'system-prompts';
-        await render();
-      }
       return;
     }
     if (b.dataset.adviceReply) {

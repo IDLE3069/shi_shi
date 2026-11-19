@@ -1031,14 +1031,15 @@ fn layer_clears_projects_the_request_did_not_offer() {
 fn archive_context_replaces_the_archived_memory_it_showed() {
     let payload =
         json!({"_archived_memory": "旧归档", "_local_context": {"records": [], "archived_memory": {"revision": 3}}});
-    let mut c = crate::archive::layer::archive_context("archive", &payload).unwrap();
+    let db = crate::Db::memory().unwrap();
+    let mut c = crate::archive::layer::archive_context(&db, "archive", &payload).unwrap();
     let mut v = json!({"archived_memory": ["新归档"], "memory_update": ["不可写"]});
     c.finish(&mut v);
     assert_eq!(v["_archived_memory_update"], json!({"before": "旧归档", "text": "新归档", "expected": 3}));
     assert!(v.get("archived_memory").is_none() && v.get("_memory_update").is_none());
     assert!(v.get("_memory_error").is_none());
     assert_eq!(v["_context_usage"]["calls"], 0);
-    assert!(crate::archive::layer::archive_context("report", &payload).is_none());
+    assert!(crate::archive::layer::archive_context(&db, "report", &payload).is_none());
     let Err(e) = c.read("read_image", &json!({"image_id": "i1"}), None) else { panic!("image read in an archive") };
     assert_eq!(e.kind(), shishi_api::ToolFailureKind::Unavailable);
 }

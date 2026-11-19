@@ -43,8 +43,8 @@ async fn patch_rejects_unknown_fields_and_bad_values_without_saving() {
     assert_eq!(e(json!({"model_profiles": {"handling": {}}})).await, "模型用途无效");
     assert_eq!(e(json!({"model_profiles": 1})).await, "模型用途配置无效");
     assert_eq!(e(json!({"daily_calls": 501})).await, "每日调用上限不能超过500");
-    assert_eq!(e(json!({"max_input_chars": 100})).await, "AI 输入上限应为5000–200000字符");
-    assert_eq!(e(json!({"retrieval_budget_chars": 10})).await, "补查预算应为 4000–1000000 字符");
+    assert_eq!(e(json!({"max_input_chars": 100})).await, "AI 输入上限应为5000–200000字");
+    assert_eq!(e(json!({"retrieval_budget_chars": 10})).await, "补查预算应为 4000–1000000字");
     assert_eq!(e(json!({"analysis_interval_minutes": 0})).await, "AI 分析间隔应为1–1440分钟");
     assert_eq!(e(json!({"analysis_lookback_hours": 87601})).await, "待分析消息时间范围应为1–87600小时");
     assert_eq!(e(json!({"message_retention_days": 0})).await, "消息保留期限应为1–3650天");

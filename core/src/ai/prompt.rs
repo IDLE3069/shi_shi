@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
-use shishi_api::json::chars as json_chars;
+use shishi_api::json::{json_words, words};
 
 use super::schema::{context_tools, schema};
 use super::{EMPTY_SEGMENT, INPUT_LIMIT_ERROR, UNCONFIGURED_PREFIX};
@@ -206,6 +206,7 @@ fn purpose_segment(policies: &Policies, kind: &str, payload: &Value, driver: &st
         fragments.extend(["memory", "memory_io", "notification_summary", "task_status_protocol"]);
     }
     fragments.extend((kind == "archive").then_some("archive_permissions"));
+    fragments.extend((kind == "report" && !payload["previous_summary"].is_null()).then_some("report_continuation"));
     for key in fragments {
         text = format!("{text}\n\n{}", prompts::default(key));
     }
@@ -263,20 +264,6 @@ const PRIVATE: [&str; 18] = [
 /// Payload fields that reach the model.
 pub fn public_fields(object: &serde_json::Map<String, Value>) -> impl Iterator<Item = (&String, &Value)> {
     object.iter().filter(|(key, _)| !PRIVATE.contains(&key.as_str()))
-}
-
-/// The public part of a payload, serialized without copying it.
-pub fn public_payload(payload: &Value) -> impl serde::Serialize + '_ {
-    struct Public<'a>(&'a Value);
-    impl serde::Serialize for Public<'_> {
-        fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-            match self.0.as_object() {
-                Some(object) => serializer.collect_map(public_fields(object)),
-                None => self.0.serialize(serializer),
-            }
-        }
-    }
-    Public(payload)
 }
 
 type Fields<'a> = BTreeMap<&'a str, &'a Value>;
@@ -352,11 +339,11 @@ pub fn prepare(policies: &Policies, route: &Route, payload: &Value, runtime: &Va
     let purpose = purpose_segment(policies, kind, payload, driver);
     let runtime = render_runtime(runtime);
     let prompt = build_prompt(policies, kind, payload, &purpose, &runtime);
-    let prompt_chars = prompt.chars().count();
+    let prompt_chars = words(&prompt);
     let schema = schema(kind);
     // API carries the contract in both response_format and the message.
-    let schema_chars = json_chars(&schema) * if driver == "api" { 2 } else { 1 };
-    let mut tools = payload["_local_context"].is_object().then(context_tools);
+    let schema_chars = json_words(&schema) * if driver == "api" { 2 } else { 1 };
+    let mut tools = payload["_local_context"].is_object().then(|| context_tools(kind));
     if let Some(registered) = payload["_registered_tools"].as_array() {
         let list = tools.get_or_insert_with(|| json!({"tools": []}));
         for t in registered {
@@ -366,7 +353,7 @@ pub fn prepare(policies: &Policies, route: &Route, payload: &Value, runtime: &Va
                 .push(json!({"name": t["name"], "description": t["description"], "inputSchema": t["parameters"]}));
         }
     }
-    let tool_chars = tools.as_ref().map(json_chars).unwrap_or(0);
+    let tool_chars = tools.as_ref().map(json_words).unwrap_or(0);
     let base = prompt_chars + schema_chars + tool_chars;
     let effort = (!route.effort.is_empty()).then_some(route.effort.as_str());
     if tools.as_ref().and_then(|t| t["tools"].as_array()).is_some_and(|t| t.len() > shishi_api::openai::MAX_TOOLS) {
@@ -378,7 +365,7 @@ pub fn prepare(policies: &Policies, route: &Route, payload: &Value, runtime: &Va
     };
     let body = || shishi_api::openai::initial_request_body(&route.model, effort, &prompt, &schema, &definitions);
     let wire_chars = match driver {
-        "api" | "codex" => json_chars(&body()),
+        "api" | "codex" => json_words(&body()),
         "dsh" => super::native::body_input_chars(&schema, &body()),
         _ => 0,
     }
@@ -400,7 +387,7 @@ pub fn prepare(policies: &Policies, route: &Route, payload: &Value, runtime: &Va
 pub fn input_sizes(config: &Config, prepared: &Prepared) -> Value {
     json!({"prompt_chars": prepared.prompt_chars, "schema_chars": prepared.schema_chars,
            "tool_schema_chars": prepared.tool_chars, "wire_overhead_chars": prepared.wire_chars,
-           "total_input_chars": prepared.total, "max_input_chars": config.max_input_chars})
+           "unit": "words", "total_input_chars": prepared.total, "max_input_chars": config.max_input_chars})
 }
 
 /// Characters left for messages after the fixed prompt, schema and tool
@@ -420,19 +407,16 @@ pub fn message_budget(config: &Config, kind: &str, policies: &Policies) -> Resul
     }
 }
 
-/// The single final check before reservation: the whole input against
-/// `max_input_chars` (tools were checked and parsed by [`prepare`]).
-pub fn validate_prepared(config: &Config, payload: &Value, prepared: &Prepared) -> Result<()> {
-    if prepared.total > config.max_input_chars {
+/// Check the whole input before reserving a call.
+pub fn validate_prepared(limit: Option<usize>, payload: &Value, prepared: &Prepared) -> Result<()> {
+    if let Some(limit) = limit.filter(|&max| prepared.total > max) {
         let mut sections: Vec<(&String, usize)> =
-            payload.as_object().into_iter().flat_map(public_fields).map(|(k, v)| (k, json_chars(v))).collect();
+            payload.as_object().into_iter().flat_map(public_fields).map(|(k, v)| (k, json_words(v))).collect();
         sections.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-        let largest = sections.iter().take(4).map(|(k, n)| format!("{k} {n} 字符")).collect::<Vec<_>>().join("、");
+        let largest = sections.iter().take(4).map(|(k, n)| format!("{k} {n} 字")).collect::<Vec<_>>().join("、");
         crate::bail!(
-            "{INPUT_LIMIT_ERROR}：{} 字符，超过有效上限 {}（含提示词、输出格式和工具定义）。主要数据：{}。本次未调用 AI，原数据保留。请精简规则或数据。字符数不等于 tokens。",
+            "{INPUT_LIMIT_ERROR}：{} 字，超过有效上限 {limit}（含提示词、输出格式和工具定义）。主要数据：{largest}。本次未调用 AI，原数据保留。请精简规则或数据。字数按汉字、字母和数字逐个计算。",
             prepared.total,
-            config.max_input_chars,
-            largest
         );
     }
     Ok(())

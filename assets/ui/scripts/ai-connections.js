@@ -255,7 +255,7 @@ document.addEventListener(
       }, 0);
       return;
     }
-    if (e.target.closest('[data-page],[data-view],[data-prompt-section]')) return;
+    if (e.target.closest('[data-page],[data-view]')) return;
     if (!e.target.closest('[data-ai-add],[data-ai-edit],[data-ai-remove]')) {
       dismissUnchangedConnectionEditor();
       return;
@@ -507,7 +507,7 @@ function acceptConnectionConfig(config, syncProfiles = false) {
       const c = modelChoice(kind);
       $('#cfg-' + kind + '-connection').value = c.unconfigured ? '__unselected__' : c.connection_id || '';
       $('#' + m).innerHTML = `<option value="${esc(c.model || '')}">${esc(c.model || '未配置')}</option>`;
-      $('#' + e).innerHTML = `<option value="${esc(c.reasoning_effort || '')}">默认</option>`;
+      $('#' + e).innerHTML = `<option value="${esc(c.reasoning_effort || '')}">${esc(c.reasoning_effort || 'default')}</option>`;
     }
   }
   const routes = modelFields.map(([kind, m, e]) => [kind, m, e, $('#' + m)?.value, $('#' + e)?.value]);

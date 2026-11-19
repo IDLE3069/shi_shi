@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use serde_json::{json, Value};
-use shishi_api::json::chars as json_chars;
+use shishi_api::json::{json_words, words};
 use shishi_api::openai::{analyze_with_model, ModelReply, ModelRound};
 use shishi_api::{ApiError, ApiErrorKind, ApiEvent};
 
@@ -240,12 +240,9 @@ pub(crate) fn frame(body: &Value) -> (String, Vec<Value>) {
 /// remaining command history matches the native text frame.
 pub(crate) fn body_input_chars(schema: &Value, body: &Value) -> usize {
     let messages = body["messages"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-    let message_chars = 2
+    words(crate::prompts::default("model_api_protocol"))
+        + words("工具目录 本次对话")
+        + json_words(&body["tools"])
         + messages.iter().map(shishi_api::openai::message_input_chars).sum::<usize>()
-        + messages.len().saturating_sub(1);
-    crate::prompts::default("model_api_protocol").chars().count()
-        + "\n\n工具目录：\n\n本次对话：".chars().count()
-        + json_chars(&body["tools"])
-        + message_chars
-        + json_chars(&envelope(schema, &body["tools"]))
+        + json_words(&envelope(schema, &body["tools"]))
 }

@@ -111,18 +111,13 @@ fn chars(text: &str) -> usize {
     text.chars().count()
 }
 
-/// Characters of `text` once escaped as a JSON string, quotes excluded.
-fn encoded(text: &str) -> usize {
-    serde_json::to_string(text).map_or(0, |s| chars(&s).saturating_sub(2))
-}
-
-fn page_fits(text: &str, limit: usize, encoded_limit: Option<usize>) -> bool {
-    chars(text) <= limit && encoded_limit.is_none_or(|remaining| encoded(text) <= remaining)
+pub(crate) fn page_fits(text: &str, word_limit: Option<usize>) -> bool {
+    chars(text) <= PAGE && word_limit.is_none_or(|remaining| shishi_api::json::words(text) <= remaining)
 }
 
 fn budget_notice(budget: usize) -> String {
     json!({
-        "error": format!("本次补查预算已用尽（上限 {budget} 字符），覆盖不完整：请只依据已读内容作答，并在结论中说明未覆盖的部分"),
+        "error": format!("本次补查预算已用尽（上限 {budget} 字），覆盖不完整：请只依据已读内容作答，并在结论中说明未覆盖的部分"),
         "budget_exhausted": true,
         "budget_chars": budget,
     })
@@ -139,13 +134,13 @@ struct Page<'a> {
 }
 
 impl Page<'_> {
-    fn fits(&self, row: &Value, limit: usize, encoded_limit: Option<usize>) -> bool {
-        page_fits(&self.render(Some(row)), limit, encoded_limit)
+    fn fits(&self, row: &Value, word_limit: Option<usize>) -> bool {
+        page_fits(&self.render(Some(row)), word_limit)
     }
 
     fn fits_alone(&self, row: &Value, include_scope: bool) -> bool {
         Page { unavailable: if include_scope { self.unavailable.clone() } else { vec![] }, ..Default::default() }
-            .fits(row, PAGE, None)
+            .fits(row, None)
     }
 
     fn render(&self, extra: Option<&Value>) -> String {
@@ -249,7 +244,7 @@ fn invalid_args(args: &Value) -> bool {
 }
 
 /// Answer one `read_context` call from `records`. `encoded_limit` is the
-/// continuation allowance left on the wire, JSON escaping included.
+/// remaining word allowance for the delivered tool message.
 pub fn query_from(
     snapshot: &Value,
     meter: &mut Meter,
@@ -262,9 +257,10 @@ pub fn query_from(
     if meter.exhausted {
         return budget_notice(budget);
     }
-    let page_limit = PAGE.min(budget.saturating_sub(meter.chars));
+    let remaining = budget.saturating_sub(meter.chars);
+    let remaining = encoded_limit.map_or(remaining, |v| v.min(remaining));
     // Even an empty page has the wrapper: stop instead of serving empties.
-    if !page_fits(&Page::default().render(None), page_limit, encoded_limit) {
+    if !page_fits(&Page::default().render(None), Some(remaining)) {
         meter.exhausted = true;
         return budget_notice(budget);
     }
@@ -319,7 +315,7 @@ pub fn query_from(
                     error = Some("offset 超出该记录正文长度");
                 } else {
                     // Only this page's window is needed; offsets count chars.
-                    let window: Vec<char> = text.chars().skip(offset).take(page_limit).collect();
+                    let window: Vec<char> = text.chars().skip(offset).take(PAGE).collect();
                     let cut = |row: &mut Value, end: usize| {
                         row["data"][field] = json!(window[..end - offset].iter().collect::<String>());
                         if offset > 0 {
@@ -333,12 +329,12 @@ pub fn query_from(
                     };
                     let mut end = offset + window.len();
                     cut(&mut row, end);
-                    if end > offset && !page.fits(&row, page_limit, encoded_limit) {
+                    if end > offset && !page.fits(&row, Some(remaining)) {
                         let (mut low, mut high) = (offset, end - 1);
                         while low < high {
                             let mid = low + (high - low).div_ceil(2);
                             cut(&mut row, mid);
-                            if page.fits(&row, page_limit, encoded_limit) {
+                            if page.fits(&row, Some(remaining)) {
                                 low = mid;
                             } else {
                                 high = mid - 1;
@@ -356,7 +352,7 @@ pub fn query_from(
                 error = Some("该记录类型不支持 offset 续读");
             }
             let mut oversized = false;
-            if error.is_none() && (no_text_space || !page.fits(&row, page_limit, encoded_limit)) {
+            if error.is_none() && (no_text_space || !page.fits(&row, Some(remaining))) {
                 if !page.rows.is_empty() {
                     // The row that did not fit stays unread for the next page.
                     break;
@@ -382,7 +378,7 @@ pub fn query_from(
                 page.errors.push(json!({"id": id, "error": error}));
                 page.omitted += usize::from(oversized);
                 let error_page = page.render(None);
-                if !page_fits(&error_page, page_limit, encoded_limit) {
+                if !page_fits(&error_page, Some(remaining)) {
                     page.errors.pop();
                     page.omitted -= usize::from(oversized);
                     scope_limited |= chars(&error_page) > PAGE;
@@ -399,7 +395,7 @@ pub fn query_from(
     }
     let limited = || {
         json!({"error": "剩余补查预算不足以返回所选记录的最小内容；可查询更小记录，覆盖仍不完整",
-               "budget_limited": true, "remaining_chars": page_limit})
+               "budget_limited": true, "remaining_words": remaining})
         .to_string()
     };
     let too_wide =
@@ -418,17 +414,17 @@ pub fn query_from(
         let value = page.render(None);
         if chars(&value) > PAGE {
             (too_wide(), false)
-        } else if !page_fits(&value, page_limit, encoded_limit) {
+        } else if !page_fits(&value, Some(remaining)) {
             (limited(), false)
         } else {
             (value, true)
         }
     };
-    if !page_fits(&result, page_limit, encoded_limit) {
+    if !page_fits(&result, Some(remaining)) {
         meter.exhausted = true;
         return budget_notice(budget);
     }
-    meter.chars += chars(&result);
+    meter.chars += shishi_api::json::words(&result);
     if delivered {
         // A delivered error uses a page, never coverage.
         meter.pages.extend(

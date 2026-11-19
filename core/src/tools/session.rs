@@ -92,22 +92,14 @@ fn unsafe_replay(call: &CallRecord) -> Failure {
     )
 }
 
-fn result_input_chars(text: &str, json_encoded: bool) -> usize {
-    if json_encoded {
-        serde_json::to_string(text).map_or(0, |s| s.chars().count() - 2)
-    } else {
-        text.chars().count()
-    }
-}
-
-/// The result as JSON within `max_chars` (escaped when `json_encoded`) and
+/// The result within the word budget and
 /// the provider's byte cap. A result that does not fit keeps the longest
 /// prefixes of stdout and stderr that do, sharing the room.
-pub(crate) fn tool_result_text(mut result: CommandResult, max_chars: usize, json_encoded: bool) -> Option<String> {
+pub(crate) fn tool_result_text(mut result: CommandResult, max_chars: usize) -> Option<String> {
     let fits = |text: &str| {
         text.len() <= shishi_api::openai::MAX_TOOL_RESULT_BYTES
-            && text.chars().count() <= max_chars.min(60_000)
-            && result_input_chars(text, json_encoded) <= max_chars
+            && text.chars().count() <= 60_000
+            && shishi_api::json::words(text) <= max_chars
     };
     let text = serde_json::to_string(&result).ok()?;
     if fits(&text) {
@@ -297,7 +289,6 @@ impl Session {
         }
         let wrapper = result_budget.map_or(0, |_| {
             shishi_api::openai::message_input_chars(&json!({"role": "tool", "tool_call_id": call_id, "content": ""}))
-                + 1
         });
         let content_budget = |used: usize| {
             let remaining = self.continuation_limit.saturating_sub(used);
@@ -306,7 +297,12 @@ impl Session {
         let within_budget = {
             let mut chars = self.continuation_chars.lock().unwrap();
             if result_budget.is_none() {
-                *chars = chars.saturating_add(shishi_api::json::chars(arguments) + name.len() + call_id.len() + 100);
+                *chars = chars.saturating_add(
+                    shishi_api::json::json_words(arguments)
+                        + shishi_api::json::words(name)
+                        + shishi_api::json::words(call_id)
+                        + 100,
+                );
             }
             // Even an empty result with the widest status and numbers must fit
             // before a process starts.
@@ -318,7 +314,7 @@ impl Session {
                 duration_ms: u64::MAX,
                 ..Default::default()
             };
-            tool_result_text(probe, content_budget(*chars), result_budget.is_some()).is_some()
+            tool_result_text(probe, content_budget(*chars)).is_some()
         };
         let result = if !within_budget {
             CommandResult::rejected(name, call_id, "本次工具续轮已达到输入预算，未执行命令".into())
@@ -357,13 +353,13 @@ impl Session {
             return Err(Failure::with(kind, format!("命令未执行：{}", result.error)));
         }
         let mut chars = self.continuation_chars.lock().unwrap();
-        let Some(text) = tool_result_text(result, content_budget(*chars), result_budget.is_some()) else {
+        let Some(text) = tool_result_text(result, content_budget(*chars)) else {
             return Err(Failure::with(
                 ToolFailureKind::BudgetExhausted,
                 "命令结果已保存在调用记录中，但续轮额度不足以完整交付；不要重放命令，请依据已收到的资料完成。",
             ));
         };
-        *chars = chars.saturating_add(wrapper + result_input_chars(&text, result_budget.is_some()));
+        *chars = chars.saturating_add(wrapper + shishi_api::json::words(&text));
         Ok(text)
     }
 

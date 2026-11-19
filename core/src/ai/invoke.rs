@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use shishi_api::json::chars as json_chars;
+use shishi_api::json::{json_words, words};
 
 use super::prompt::{self, Policies, Prepared, Route};
 use super::provider::{self, Context, Done, Event, Job};
@@ -113,7 +113,7 @@ pub async fn build(ctx: &Ctx, kind: &str, mode: Mode, trigger: &str, payload: Va
 /// here, so the request a domain chose by fitting is sent as measured.
 pub struct Measured<R> {
     pub request: R,
-    /// Characters of the rendered request ([`Prepared::total`]).
+    /// Words of the rendered request ([`Prepared::total`]).
     pub total: usize,
     rendered: Option<Box<dyn Any + Send>>,
 }
@@ -217,7 +217,9 @@ pub async fn invoke(ctx: &Arc<Ctx>, invocation: Invocation, cancel: &Cancel) -> 
         crate::bail!("{CANCELLED}");
     }
     let source = prompt::source_info(&route);
-    if let Err(error) = prompt::validate_prepared(&config, &payload, &prepared) {
+    let input_limit =
+        (kind != "report" || crate::archive::reports::row_count(&payload) != 1).then_some(config.max_input_chars);
+    if let Err(error) = prompt::validate_prepared(input_limit, &payload, &prepared) {
         let detail = json!({"request_id": request_id, "kind": kind, "source": source, "error": error.0});
         ctx.db.log("ai_rejected", detail).await?;
         return Err(error);
@@ -233,7 +235,7 @@ pub async fn invoke(ctx: &Arc<Ctx>, invocation: Invocation, cancel: &Cancel) -> 
             "ai_start",
             json!({"request_id": request_id, "kind": kind, "source": source, "trigger": trigger, "model": route.model,
             "reasoning_effort": route.effort, "messages": messages, "batch": payload["_batch_metrics"],
-            "runtime": runtime, "input_chars": json_chars(&prompt::public_payload(&payload)),
+            "runtime": runtime, "input_chars": payload.as_object().into_iter().flat_map(prompt::public_fields).map(|(k, v)| words(k) + json_words(v)).sum::<usize>(),
             "input_sizes": prompt::input_sizes(&config, &prepared)}),
         )
         .await;
@@ -266,6 +268,7 @@ pub async fn invoke(ctx: &Arc<Ctx>, invocation: Invocation, cancel: &Cancel) -> 
                     kind,
                     route,
                     config,
+                    input_limit,
                     prepared,
                     session,
                     root,

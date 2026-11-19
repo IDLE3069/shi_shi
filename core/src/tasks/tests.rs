@@ -509,6 +509,50 @@ fn runtime_routes_task_methods_and_snapshot() {
     assert_eq!(selected["tasks"][0]["description"], "");
 }
 
+#[tokio::test]
+async fn focus_edits_preserve_saved_filters_and_an_empty_list_across_reopen() {
+    let dir = crate::testing::temp_dir("focus-views");
+    let open = || Ctx::open(dir.clone(), std::sync::Arc::new(crate::NoHost)).unwrap();
+    let ctx = open();
+    let state = crate::state::snapshot(&ctx, &json!({})).await.unwrap();
+    let defaults = state["focus_views"].as_array().unwrap();
+    let names: Vec<_> = defaults.iter().map(|v| v["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["待处理", "处理中", "被阻塞", "延后处理"]);
+    let filters = json!({"scope":["待处理","归档"],"query":"合成","view":"","tag_filters":{"类别":["甲","乙"]},"priorities":["高"]});
+    let added = super::handle(&ctx, "focus_view_edit", json!({"action":"add","name":" 合成关注 ","filters":filters}))
+        .await
+        .unwrap();
+    assert_eq!(added[4]["name"], "合成关注");
+    let id = &added[4]["id"];
+    let renamed = ctx.db.edit_focus_view(json!({"action":"rename","id":id,"name":"复核"})).await.unwrap();
+    assert_eq!(renamed[4], json!({"id":id,"name":"复核","filters":filters}));
+    let renamed = ctx.db.edit_focus_view(json!({"action":"rename","id":"待处理","name":"待跟进"})).await.unwrap();
+    assert_eq!(renamed[0]["id"], "待处理");
+    assert!(ctx.db.edit_focus_view(json!({"action":"rename","id":id,"name":" "})).await.is_err());
+    let move_view = |id: &Value, target: &Value, after| {
+        ctx.db.edit_focus_view(json!({"action":"move","id":id,"target":target,"after":after}))
+    };
+    let first = move_view(id, &json!("待处理"), false).await.unwrap();
+    assert_eq!(first[0], renamed[4]);
+    let moved = move_view(&json!("待处理"), &json!("延后处理"), true).await.unwrap();
+    assert_eq!(moved, json!([renamed[4], renamed[1], renamed[2], renamed[3], renamed[0]]));
+    let revision = ctx.db.revision();
+    assert_eq!(move_view(id, &json!("处理中"), false).await.unwrap(), moved);
+    assert_eq!(move_view(id, id, true).await.unwrap(), moved);
+    assert_eq!(ctx.db.revision(), revision);
+    assert!(move_view(id, &json!("missing"), false).await.is_err());
+    drop(ctx);
+    let ctx = open();
+    let snapshot = crate::state::snapshot(&ctx, &json!({})).await.unwrap();
+    assert_eq!(snapshot["focus_views"], moved);
+    assert_eq!(snapshot["task_focus_counts"][id.as_str().unwrap()], 0);
+    for view in renamed.as_array().unwrap() {
+        ctx.db.edit_focus_view(json!({"action":"delete","id":view["id"]})).await.unwrap();
+    }
+    drop(ctx);
+    assert_eq!(crate::state::snapshot(&open(), &json!({})).await.unwrap()["focus_views"], json!([]));
+}
+
 fn reply(value: Value) -> crate::ai::provider::fake::Step {
     crate::ai::provider::fake::Step::Reply(value, json!({"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}))
 }
@@ -653,12 +697,43 @@ fn list_queries_match_the_rust_rules() {
     for focus in ["待处理", "处理中", "被阻塞", "延后处理"] {
         assert!(all.iter().any(|t| t.focus(at) == Some(focus)), "{focus}");
     }
-    let (counts, next) = query::focus_counts(&c, at).unwrap();
+    let (counts, next) = query::focus_counts(&c, at, &[]).unwrap();
     for (focus, n) in &counts {
         assert_eq!(n.as_u64().unwrap() as usize, all.iter().filter(|t| t.focus(at) == Some(focus.as_str())).count());
     }
     let deferred = all.iter().filter(|t| t.focus(at) == Some("延后处理")).map(|t| t.deferred_until).min();
     assert_eq!(next, deferred);
+
+    let views: Vec<_> = [
+        json!({"scope":["处理中","待处理","被阻塞"]}),
+        json!({"scope":["待处理","待处理"]}),
+        json!({"query":"找不到的合成事项"}),
+        json!({"scope":["全部","归档"]}),
+        json!({"scope":["归档","待处理"], "query":" ALPHA "}),
+        json!({"view":"today"}),
+        json!({"tag_filters":{"事项类型":["问题排查"]},"priorities":["紧急","高"]}),
+        json!({"scope":["归档"],"view":"today","priorities":["普通"]}),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, overrides)| {
+        let mut filters = json!({"scope":[], "view":"", "query":"", "tag_filters":{}, "priorities":[]});
+        filters.as_object_mut().unwrap().extend(overrides.as_object().unwrap().clone());
+        json!({"id": i.to_string(), "filters": filters})
+    })
+    .collect();
+    let (saved, _) = query::focus_counts(&c, at, &views).unwrap();
+    for v in &views {
+        let f = &v["filters"];
+        let page = if f["scope"] == json!(["归档"]) { query::archived(&c, f) } else { query::active(&c, f) }.unwrap();
+        assert_eq!(saved[v["id"].as_str().unwrap()], page["total"], "{f}");
+    }
+    assert_eq!(
+        saved["0"].as_u64().unwrap(),
+        ["处理中", "待处理", "被阻塞"].iter().map(|s| counts[*s].as_u64().unwrap()).sum::<u64>()
+    );
+    assert_eq!(saved["2"], 0);
+    assert!(saved["3"].as_u64().unwrap() > 50);
 
     // tasks_query: priority order, deferred tasks refilled in return order.
     for p in [
@@ -738,7 +813,7 @@ fn list_queries_match_the_rust_rules() {
     // recency, number on ties; deferred slots refilled by return time.
     let day = |ms: i64| (ms + 8 * 3_600_000).div_euclid(86_400_000);
     let due_ms = |t: &Task| chrono::DateTime::parse_from_rfc3339(&t.due).ok().map(|d| d.timestamp_millis());
-    let front = |scope: &str, view: &str, text: &str, keep: &dyn Fn(&[Tag]) -> bool| -> Vec<String> {
+    let front = |scopes: &[&str], view: &str, text: &str, keep: &dyn Fn(&[Tag]) -> bool| -> Vec<String> {
         let text = text.trim().to_lowercase();
         let mut list: Vec<&Task> = all
             .iter()
@@ -748,12 +823,18 @@ fn list_queries_match_the_rust_rules() {
                 "today" => t.focus(at).is_some() && due_ms(t).is_some_and(|d| day(d) == day(at)),
                 focus => t.focus(at) == Some(focus),
             })
-            .filter(|t| !t.archived && t.merged_into.is_empty())
-            .filter(|t| match scope {
-                "全部" => true,
-                "未完成" => model::ACTIVE.contains(&t.status.as_str()),
-                "待处理" | "处理中" | "被阻塞" | "延后处理" => t.focus(at) == Some(scope),
-                status => t.status == status,
+            .filter(|t| t.merged_into.is_empty())
+            .filter(|t| {
+                if t.archived {
+                    return t.generation.is_empty() && scopes.contains(&"归档");
+                }
+                scopes.is_empty()
+                    || scopes.iter().any(|&scope| match scope {
+                        "全部" => true,
+                        "未完成" => model::ACTIVE.contains(&t.status.as_str()),
+                        "待处理" | "处理中" | "被阻塞" | "延后处理" => t.focus(at) == Some(scope),
+                        status => t.status == status,
+                    })
             })
             .filter(|t| {
                 text.is_empty()
@@ -783,26 +864,33 @@ fn list_queries_match_the_rust_rules() {
     for scope in ["全部", "未完成", "待处理", "处理中", "被阻塞", "延后处理", "已完成", "已取消"]
     {
         for view in ["", "today", "待处理", "被阻塞", "延后处理"] {
-            cases.push((scope, view, "", 0));
+            cases.push((vec![scope], view, "", 0));
         }
     }
     for text in ["alpha", " #1", "等审", "事项1"] {
         for k in 0..keeps.len() {
-            cases.push(("全部", "", text, k));
+            cases.push((vec!["全部"], "", text, k));
         }
     }
     for k in 1..keeps.len() {
-        cases.push(("待处理", "", "", k));
-        cases.push(("全部", "被阻塞", "", k));
+        cases.push((vec!["待处理"], "", "", k));
+        cases.push((vec!["全部"], "被阻塞", "", k));
     }
+    cases.extend([
+        (vec![], "", "", 0),
+        (vec!["待处理", "处理中"], "", "", 0),
+        (vec!["全部", "归档", "待处理"], "", "", 0),
+        (vec!["归档", "已完成"], "", "alpha", 2),
+        (vec!["归档", "未完成", "延后处理"], "today", "", 1),
+    ]);
     let mut paged = false;
-    for (scope, view, text, k) in cases {
+    for (scopes, view, text, k) in cases {
         let (filter, keep) = &keeps[k];
         let mut p = filter.clone();
-        p["scope"] = json!(scope);
+        p["scope"] = if scopes.len() == 1 { json!(scopes[0]) } else { json!(scopes) };
         p["view"] = json!(view);
         p["query"] = json!(text);
-        let want = front(scope, view, text, keep.as_ref());
+        let want = front(&scopes, view, text, keep.as_ref());
         assert_eq!(every_page(&c, query::active, &p), want, "{p}");
         let first = query::active(&c, &p).unwrap();
         assert_eq!(first["total"], want.len(), "{p}");
@@ -828,6 +916,7 @@ fn list_queries_match_the_rust_rules() {
     }
     assert!(paged);
     assert_eq!(query::active(&c, &json!({"scope": "无效"})).unwrap_err().0, "事项范围无效");
+    assert_eq!(query::active(&c, &json!({"scope": ["归档", "无效"]})).unwrap_err().0, "事项范围无效");
 
     // The snapshot carries the referred tasks only, whatever is unarchived.
     let open: Vec<&Task> = all.iter().filter(|t| t.focus(at).is_some()).collect();

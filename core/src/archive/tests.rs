@@ -736,7 +736,7 @@ async fn reports_start_after_the_last_archive_and_keep_an_unsummarized_delta() {
 }
 
 #[tokio::test]
-async fn reports_over_the_limit_drop_whole_old_days_but_keep_the_last_seven() {
+async fn reports_batch_only_the_changes_inside_the_lookback() {
     let ctx = ctx();
     let now = time::now();
     for (i, days) in [10, 10, 8, 3, 0].into_iter().enumerate() {
@@ -752,34 +752,278 @@ async fn reports_over_the_limit_drop_whole_old_days_but_keep_the_last_seven() {
 
     let stub = Stub { max_delta: Some(3), ..Stub::new(&ctx) }.reply(Err(Error::new("模型超时")));
     let r = report_now(&ctx, &stub).await.unwrap();
-    assert_eq!(sent(&stub), 3, "the oldest day goes whole");
-    assert_eq!(r["delta_omitted"], 2);
+    assert_eq!(sent(&stub), 2);
+    assert_eq!(r["tasks"].as_array().unwrap().len(), 5);
+    assert_eq!(r["delta"].as_array().unwrap().len(), 2);
 
-    let stub = Stub { max_delta: Some(1), ..Stub::new(&ctx) };
+    let stub = Stub { max_delta: Some(1), ..Stub::new(&ctx) }
+        .reply(Ok(json!({"summary": "前三天的进展"})))
+        .reply(Err(Error::new("第二批失败")));
+    let failed = report_now(&ctx, &stub).await.unwrap();
+    assert_eq!(failed["summary_error"], "第二批失败");
+    assert_eq!(cursor(&ctx, REPORT_CURSOR).await, 0);
+
+    let stub = Stub { max_delta: Some(1), ..Stub::new(&ctx) }
+        .reply(Ok(json!({"summary": "前三天的进展"})))
+        .reply(Ok(json!({"summary": "整份报表"})));
     let r = report_now(&ctx, &stub).await.unwrap();
-    assert_eq!(sent(&stub), 2, "the last seven days are sent even when too large");
-    assert_eq!(r["delta_omitted"], 3);
+    let calls = stub.seen.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|c| c.payload["delta"].as_array().unwrap().len() == 1));
+    assert_eq!(calls[0].payload["delta"][0]["task_id"], r["delta"][0]["task_id"]);
+    assert_eq!(calls[1].payload["delta"][0]["task_id"], r["delta"][1]["task_id"]);
+    assert_eq!(calls[1].payload["previous_summary"]["summary"], "前三天的进展");
+    assert_eq!(r["ai_summary"]["summary"], "整份报表");
 }
 
 #[tokio::test]
-async fn archive_events_carry_changed_fields_and_their_summaries() {
+async fn reports_always_read_open_tasks_and_look_back_only_to_the_last_success_or_seven_days() {
+    let ctx = ctx();
+    let at = time::now();
+    let week = at - 7 * time::DAY;
+    let yesterday = at - time::DAY;
+    let times = [week - time::DAY, week - 1, week, yesterday - 1, yesterday + 1, at - time::HOUR];
+    let ids = write(&ctx, move |c| {
+        let mut ids = Vec::new();
+        for (i, changed) in times.into_iter().enumerate() {
+            let t = crate::data::tasks::edit(c, &json!({"task": {"title": format!("合成事项{i}")}}))?;
+            let id = t["id"].as_str().unwrap();
+            let archived = (1..=4).contains(&i);
+            c.execute(
+                "UPDATE tasks SET archived=?1, archived_at=?2, updated=?3 WHERE id=?4",
+                rusqlite::params![
+                    archived,
+                    if archived { changed } else { 0 },
+                    if archived { at } else { changed },
+                    id
+                ],
+            )?;
+            c.execute("UPDATE task_audit SET time=?1 WHERE task_id=?2", rusqlite::params![changed, id])?;
+            ids.push(id.to_string());
+        }
+        c.execute(
+            "INSERT INTO archive_attempts(id, trigger, status, created, finished)
+                   VALUES ('failed', 'manual_archive', 'failed', ?1, ?1)",
+            [at],
+        )?;
+        Ok(ids)
+    })
+    .await;
+    for (success, task_rows, changes) in [
+        (None, vec![0usize, 2, 3, 4, 5], vec![2usize, 3, 4, 5]),
+        (Some(week - time::DAY), vec![0, 2, 3, 4, 5], vec![2, 3, 4, 5]),
+        (Some(yesterday), vec![0, 4, 5], vec![4, 5]),
+    ] {
+        if let Some(finished) = success {
+            write(&ctx, move |c| {
+                c.execute(
+                    "INSERT INTO archive_attempts(id, trigger, status, created, started, finished)
+                           VALUES (?1, 'manual_archive', 'succeeded', ?2, ?2, ?3)",
+                    rusqlite::params![finished.to_string(), finished - time::HOUR, finished],
+                )?;
+                kv::set(c, ARCHIVE_CURSOR, &store::max_seq(c)?)?;
+                Ok(())
+            })
+            .await;
+        }
+        let report = ctx.db.prepare_report("早报".into(), at).await.unwrap();
+        let selected = |section: &str, key: &str| {
+            report[section].as_array().unwrap().iter().map(|row| row[key].as_str().unwrap()).collect::<Vec<_>>()
+        };
+        assert_eq!(selected("tasks", "id"), task_rows.iter().map(|&i| ids[i].as_str()).collect::<Vec<_>>());
+        assert_eq!(selected("delta", "task_id"), changes.iter().map(|&i| ids[i].as_str()).collect::<Vec<_>>());
+    }
+    let stub = Stub::new(&ctx);
+    reports::report(&ctx, &stub, "早报", Mode::Automatic).await.unwrap();
+    let calls = stub.seen.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].payload["_trigger"], "scheduled_report");
+    assert_eq!(calls[0].payload["report_tasks"].as_array().unwrap().len(), 3);
+    assert_eq!(calls[0].payload["delta"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn reports_use_audit_order_when_the_archive_and_task_share_a_timestamp() {
+    let ctx = ctx();
+    let at = time::now();
+    let before = task(&ctx, "归档前", "已完成").await;
+    let after = task(&ctx, "归档后", "已完成").await;
+    write(&ctx, move |c| {
+        crate::data::tasks::archive(c, &json!({"id": before.id, "updated": before.updated}))?;
+        c.execute(
+            "INSERT INTO archive_attempts(id, trigger, status, created, finished, report_id)
+                   VALUES ('a', 'manual_archive', 'succeeded', ?1, ?1, 'r')",
+            [at],
+        )?;
+        crate::data::audit::write(c, "archive_commit", "", "", &Value::Null, &json!({"report": "r"}))?;
+        crate::data::tasks::archive(c, &json!({"id": after.id, "updated": after.updated}))?;
+        c.execute("UPDATE tasks SET archived_at=?1", [at])?;
+        c.execute("UPDATE task_audit SET time=?1", [at])?;
+        kv::set(c, ARCHIVE_CURSOR, &store::max_seq(c)?)?;
+        Ok(())
+    })
+    .await;
+    let report = ctx.db.prepare_report("早报".into(), at + time::HOUR).await.unwrap();
+    assert_eq!(report["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(report["tasks"][0]["title"], "归档后");
+    assert_eq!(report["delta"].as_array().unwrap().len(), 1);
+    assert_eq!(report["delta"][0]["task_id"], report["tasks"][0]["id"]);
+    assert_eq!(report["delta"][0]["kind"], "manual_archive");
+}
+
+#[tokio::test]
+async fn archive_groups_automatic_changes_and_keeps_human_edits_without_message_ids() {
     let ctx = ctx();
     let t = task(&ctx, "整理周报", "待处理").await;
-    ai_update(&ctx, &t, "开始整理周报", |t| {
+    let t = ai_update(&ctx, &t, "自动状态调整", |t| {
         t.status = "处理中".into();
-        t.evidence.direct = ids(&["m1"]);
+        t.evidence.direct = ids(&["private-message-key"]);
+    })
+    .await;
+    let id = t.id.clone();
+    write(&ctx, move |c| {
+        crate::data::audit::write(
+            c,
+            "manual_ai_edit",
+            &id,
+            "一句话修改：改为周五交稿",
+            &json!({"due":1,"evidence":{"direct":["private-message-key"]}}),
+            &json!({"due":2,"evidence":{"direct":[]}}),
+        )
     })
     .await;
     let stub = Stub::new(&ctx);
     manual(&ctx, &stub).await.unwrap();
     let sent = stub.seen.lock().unwrap()[0].payload.clone();
-    let event = &sent["evidence"][1]["event"];
-    assert_eq!(event["change_summary"], "开始整理周报");
-    assert_eq!(
-        event["changes"],
-        json!({"status": {"before": "待处理", "after": "处理中"}, "evidence": {"direct": {"added": ["m1"]}}})
-    );
-    assert_eq!(sent["report_tasks"][0]["evidence"]["direct"], json!(["m1"]));
+    let events = sent["evidence"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["event"]["kind"], "manual_edit");
+    assert_eq!(events[1]["event"]["detail"], "一句话修改：改为周五交稿");
+    assert_eq!(events[1]["event"]["changes"], json!({"due":{"before":1,"after":2}}));
+    assert_eq!(sent["automatic_changes"][t.number.to_string()], json!({"ai_update":1}));
+    assert_eq!(sent["report_tasks"][0]["number"], t.number);
+    assert_eq!(sent["report_tasks"][0]["status"], "处理中");
+    assert!(!sent.to_string().contains("private-message-key"));
+    assert!(!sent.to_string().contains("自动状态调整"));
+    assert_eq!(get_task(&ctx, &t.id).await.evidence.direct, ["private-message-key"]);
+}
+
+#[tokio::test]
+async fn archive_history_pages_follow_task_time_and_the_batch_boundary() {
+    use shishi_api::{ToolFailureKind, ToolResult};
+    let ctx = Ctx::memory(Config {
+        ai_connections: vec![crate::config::Connection {
+            id: "synthetic".into(),
+            driver: "api".into(),
+            ..Default::default()
+        }],
+        ..Config::default()
+    })
+    .unwrap();
+    let t = task(&ctx, "分页事项", "待处理").await;
+    let t = ai_update(&ctx, &t, "自动更新可补查", |t| t.status = "处理中".into()).await;
+    let other = task(&ctx, "另一事项", "待处理").await;
+    let at = time::now();
+    let earlier = at - 2 * time::DAY;
+    let since = at - time::DAY;
+    let body = "甲🙂！".repeat(3100);
+    let (id, other_id, long) = (t.id.clone(), other.id.clone(), body.clone());
+    write(&ctx, move |c| {
+        store::put_attempt(
+            c,
+            &Attempt {
+                id: "previous".into(),
+                status: "succeeded".into(),
+                finished: since,
+                created: since - 100,
+                ..Default::default()
+            },
+        )?;
+        for (key, task, text, time, withdrawn) in [
+            ("before", &id, "旧内容", earlier, false),
+            ("short", &id, "同刻短消息", at, false),
+            ("long", &id, long.as_str(), at, false),
+            ("withdrawn", &id, "已撤回", at, true),
+            ("future", &id, "未来消息", at + time::DAY, false),
+            ("other", &other_id, "另一个事项的原文", at, false),
+        ] {
+            let m = crate::messages::Message {
+                id: format!("private-key-{key}"),
+                time,
+                text: text.into(),
+                withdrawn,
+                ..Default::default()
+            };
+            crate::data::messages::upsert(c, &m)?;
+            c.execute(
+                "INSERT INTO task_evidence(task_id,message_id,role) VALUES(?1,?2,'direct')",
+                rusqlite::params![task, m.id],
+            )?;
+        }
+        c.execute(
+            "INSERT INTO task_evidence(task_id,message_id,role) VALUES(?1,'private-key-long','background')",
+            [id],
+        )?;
+        Ok(())
+    })
+    .await;
+    let horizon = time::now();
+    let model = layer::model(&ctx).await.unwrap();
+    let (batch, _) = run::fit(&ctx, model.as_ref(), &Attempt::default(), Mode::Manual, horizon, 80_000).await.unwrap();
+    assert_eq!(batch.payload["_local_context"]["since"], since);
+    assert_eq!(batch.payload["_local_context"]["until"], horizon);
+    let mut source = layer::archive_context(&ctx.db, "archive", &batch.payload).unwrap();
+    let number = t.number;
+    tokio::task::spawn_blocking(move || {
+        let page = |result: ToolResult| {
+            let ToolResult::Text(text) = result else { panic!("expected history text") };
+            assert!(text.chars().count() <= 4000);
+            assert!(!text.contains("private-key-"));
+            serde_json::from_str::<Value>(&text).unwrap()
+        };
+        let mut args = json!({"task_number":number});
+        let mut content = String::new();
+        let mut pages = 0;
+        loop {
+            let v = page(source.read("read_context", &args, Some(5000)).unwrap());
+            pages += 1;
+            for r in v["records"].as_array().unwrap() {
+                content.push_str(r.as_str().unwrap());
+            }
+            let Some(token) = v.get("next_cursor") else { break };
+            assert!(pages < 10);
+            assert_eq!(
+                source.read("read_context", &json!({"cursor":token,"until":at}), None).err().unwrap().kind(),
+                ToolFailureKind::InvalidArguments
+            );
+            args = json!({"cursor":token});
+        }
+        assert!(pages >= 3);
+        assert!(content.contains(&body));
+        assert_eq!(content.matches('甲').count(), 3100);
+        assert!(content.ends_with("同刻短消息"));
+        for absent in ["旧内容", "未来消息", "已撤回", "另一个事项的原文"] {
+            assert!(!content.contains(absent));
+        }
+        let older = page(
+            source.read("read_context", &json!({"task_number":number,"since":earlier,"until":earlier}), None).unwrap(),
+        );
+        assert_eq!(older["records"].as_array().unwrap().len(), 1);
+        assert!(older["records"][0].as_str().unwrap().ends_with("旧内容"));
+        let updates = page(source.read("read_context", &json!({"task_number":number,"kind":"update"}), None).unwrap());
+        assert!(updates["records"].to_string().contains("manual_edit"));
+        assert!(updates["records"].to_string().contains("自动更新可补查"));
+        assert_eq!(
+            source.read("read_context", &json!({"task_number":number+100}), None).err().unwrap().kind(),
+            ToolFailureKind::Denied
+        );
+        assert_eq!(
+            source.read("read_context", &json!({"task_number":number}), Some(1)).err().unwrap().kind(),
+            ToolFailureKind::BudgetExhausted
+        );
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

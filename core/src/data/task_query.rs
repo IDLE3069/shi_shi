@@ -1,7 +1,7 @@
 //! Read-side task queries: the console list, one task, the task page's
 //! active and archive lists, a task's change history and the snapshot rows.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use rusqlite::types::Value as Sql;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
@@ -10,7 +10,7 @@ use serde_json::{json, Map, Value};
 use super::tasks::get;
 use super::{kv, pages, rows, schedules, Db};
 use crate::state::Scope;
-use crate::tasks::model::{Task, STATUSES};
+use crate::tasks::model::{from_json, new_id, Task, STATUSES};
 use crate::tasks::query::{label, matches, record_ascending, record_range, snapshot_json, terms};
 use crate::tasks::tags::{self, Tag};
 use crate::{time, Result};
@@ -30,6 +30,42 @@ impl Db {
 
     pub async fn active_tasks(&self, p: Value) -> Result<Value> {
         self.read(move |c| active(c, &p)).await
+    }
+
+    pub async fn edit_focus_view(&self, p: Value) -> Result<Value> {
+        self.write(move |tx| {
+            let mut views = focus_views(tx)?;
+            let name = p["name"].as_str().unwrap_or("").trim();
+            if matches!(p["action"].as_str(), Some("add" | "rename")) && name.is_empty() {
+                crate::bail!("请填写关注名称");
+            }
+            if p["action"] == "add" {
+                let f = &p["filters"];
+                let filters = json!({
+                    "scope": from_json::<Vec<String>>(&f["scope"])?, "view": from_json::<String>(&f["view"])?,
+                    "query": from_json::<String>(&f["query"])?, "priorities": from_json::<Vec<String>>(&f["priorities"])?,
+                    "tag_filters": from_json::<BTreeMap<String, Vec<String>>>(&f["tag_filters"])?,
+                });
+                views.push(json!({"id": new_id(), "name": name, "filters": filters}));
+            } else {
+                let position = |id: &Value| views.iter().position(|v| &v["id"] == id).ok_or("找不到这条关注");
+                let i = position(&p["id"])?;
+                match p["action"].as_str() {
+                    Some("rename") => views[i]["name"] = name.into(),
+                    Some("delete") => { views.remove(i); }
+                    Some("move") => {
+                        let slot = position(&p["target"])? + usize::from(p["after"] == true);
+                        let to = slot - usize::from(i < slot);
+                        if to == i { return Ok(views.into()); }
+                        let view = views.remove(i);
+                        views.insert(to, view);
+                    }
+                    _ => crate::bail!("关注操作无效"),
+                }
+            }
+            kv::set(tx, "focus_views", &views)?;
+            Ok(views.into())
+        }).await
     }
 
     pub async fn merge_candidates(&self, p: Value) -> Result<Value> {
@@ -185,16 +221,12 @@ fn listed(r: &Row) -> rusqlite::Result<Task> {
     })
 }
 
-const ARCHIVED: &str = concat!(
-    include_str!("sql/tasks/ranked.sql"),
-    include_str!("sql/tasks/listed.sql"),
-    include_str!("sql/tasks/archived.sql")
-);
-const ACTIVE: &str = concat!(
-    include_str!("sql/tasks/ranked.sql"),
-    include_str!("sql/tasks/listed.sql"),
-    include_str!("sql/tasks/active.sql")
-);
+macro_rules! listed_sql {
+    ($($tail:expr),+) => { concat!(include_str!("sql/tasks/ranked.sql"), include_str!("sql/tasks/listed.sql"), $($tail),+) };
+}
+const ARCHIVED: &str = listed_sql!(include_str!("sql/tasks/archived.sql"));
+const ACTIVE: &str = listed_sql!(include_str!("sql/tasks/picked.sql"), include_str!("sql/tasks/active.sql"));
+const FOCUS_TOTAL: &str = listed_sql!(include_str!("sql/tasks/picked.sql"), "SELECT count(*) FROM picked");
 const FOCUS: [&str; 4] = ["待处理", "处理中", "被阻塞", "延后处理"];
 
 /// `archived_tasks_query`: archived, unmerged, generated tasks filtered by
@@ -210,21 +242,39 @@ pub fn archived(conn: &Connection, p: &Value) -> Result<Value> {
     Ok(result)
 }
 
-/// `active_tasks_query`: the task page outside the archive. `scope` is
-/// 全部, a focus view or a status; `view` the quick view (a focus view or
-/// `today`); tags, level and text filter as on the archive page. 50 per
-/// page in priority order, deferred tasks reordered among their own slots
-/// by when they return.
+/// Selected scopes form a union before quick-view filters, priority sorting and pagination.
 pub fn active(conn: &Connection, p: &Value) -> Result<Value> {
-    let scope = p["scope"].as_str().unwrap_or("全部");
-    if !["全部", "未完成"].contains(&scope) && !FOCUS.contains(&scope) && !STATUSES.contains(&scope) {
+    let scopes = match &p["scope"] {
+        Value::Array(items) => items.as_slice(),
+        Value::Null => &[],
+        item => std::slice::from_ref(item),
+    };
+    if !scopes.iter().all(|s| {
+        s.as_str()
+            .is_some_and(|s| ["全部", "未完成", "归档"].contains(&s) || FOCUS.contains(&s) || STATUSES.contains(&s))
+    }) {
         crate::bail!("事项范围无效");
     }
     let view = p["view"].as_str().unwrap_or("");
     if !view.is_empty() && view != "today" && !FOCUS.contains(&view) {
         crate::bail!("快速视图无效");
     }
-    list(conn, p, ACTIVE, 1, [scope.to_string().into(), view.to_string().into()])
+    list(conn, p, ACTIVE, 1, [serde_json::to_string(scopes)?.into(), view.to_string().into()])
+}
+
+fn list_catalog(catalog: &[tags::Group], kind: &str, at: i64) -> Result<[Sql; 4]> {
+    Ok([at.into(), kind.to_string().into(), level(catalog, kind).into(), serde_json::to_string(catalog)?.into()])
+}
+
+fn list_filters(p: &Value, query: String, [a, b]: [Sql; 2]) -> [Sql; 5] {
+    let json_or_null = |v: Option<&Value>| v.map(Value::to_string);
+    [
+        a,
+        b,
+        query.into(),
+        json_or_null(p["tag_filters"].as_object().map(|_| &p["tag_filters"])).into(),
+        json_or_null(p["priorities"].as_array().map(|_| &p["priorities"])).into(),
+    ]
 }
 
 /// One page of a listed.sql source whose own parameters are ?5 and ?6.
@@ -237,19 +287,8 @@ fn list(conn: &Connection, p: &Value, source: &str, keys: usize, own: [Sql; 2]) 
     }
     let (catalog, kind) = super::tags::catalog(conn)?;
     let at = time::now();
-    let json_or_null = |v: Option<&Value>| v.map(Value::to_string);
-    let [a, b] = own;
-    let params: Vec<Sql> = vec![
-        at.into(),
-        kind.clone().into(),
-        level(&catalog, &kind).into(),
-        serde_json::to_string(&catalog)?.into(),
-        a,
-        b,
-        query.into(),
-        json_or_null(p["tag_filters"].as_object().map(|_| &p["tag_filters"])).into(),
-        json_or_null(p["priorities"].as_array().map(|_| &p["priorities"])).into(),
-    ];
+    let mut params = Vec::from(list_catalog(&catalog, &kind, at)?);
+    params.extend(list_filters(p, query, own));
     let mut found = Vec::new();
     let mut result = pages::Page {
         source,
@@ -380,9 +419,12 @@ pub fn tasks_revision(conn: &Connection, at: i64) -> Result<String> {
     Ok(format!("{tasks}:{}", kv::get_i64(conn, crate::messages::REVISION)?))
 }
 
-/// Unfinished tasks per focus view (`Task::focus`), each counted once
-/// whatever the page filters, and when the first deferred one returns.
-pub fn focus_counts(conn: &Connection, at: i64) -> Result<(Map<String, Value>, Option<i64>)> {
+fn focus_views(conn: &Connection) -> Result<Vec<Value>> {
+    Ok(kv::get(conn, "focus_views")?.unwrap_or_else(|| FOCUS.iter().map(|s| json!({"id": s, "name": s})).collect()))
+}
+
+/// Counts by focus ID and the next deferred task's return time.
+pub fn focus_counts(conn: &Connection, at: i64, views: &[Value]) -> Result<(Map<String, Value>, Option<i64>)> {
     let mut counts: Map<String, Value> = FOCUS.iter().map(|f| (f.to_string(), json!(0))).collect();
     let mut next = None;
     let mut stmt = conn.prepare_cached(
@@ -400,16 +442,52 @@ pub fn focus_counts(conn: &Connection, at: i64) -> Result<(Map<String, Value>, O
         }
         counts.insert(focus, json!(r.get::<_, i64>(1)?));
     }
+    let mut filtered = Vec::new();
+    for v in views {
+        let Some(f) = v.get("filters") else { continue };
+        let id = v["id"].as_str().unwrap();
+        let scopes = f["scope"].as_array().unwrap();
+        if f["query"] == ""
+            && f["view"] == ""
+            && f["tag_filters"] == json!({})
+            && f["priorities"] == json!([])
+            && !scopes.is_empty()
+            && scopes.iter().all(|s| FOCUS.contains(&s.as_str().unwrap()))
+        {
+            let n: i64 =
+                FOCUS.iter().filter(|k| scopes.iter().any(|s| s == **k)).map(|k| counts[*k].as_i64().unwrap()).sum();
+            counts.insert(id.into(), n.into());
+        } else {
+            filtered.push((id, f));
+        }
+    }
+    if !filtered.is_empty() {
+        let (catalog, kind) = super::tags::catalog(conn)?;
+        let common = list_catalog(&catalog, &kind, at)?;
+        let mut stmt = conn.prepare_cached(FOCUS_TOTAL)?;
+        for (id, f) in filtered {
+            let view = if f["scope"] == json!(["归档"]) { "" } else { f["view"].as_str().unwrap() };
+            let args = list_filters(
+                f,
+                f["query"].as_str().unwrap().trim().to_lowercase(),
+                [f["scope"].to_string().into(), view.to_string().into()],
+            );
+            let total: i64 = stmt.query_row(params_from_iter(common.iter().chain(&args)), |r| r.get(0))?;
+            counts.insert(id.into(), total.into());
+        }
+    }
     Ok((counts, next))
 }
 
 /// Snapshot keys of the task domain.
 pub(super) fn part(conn: &Connection, scope: &Scope, out: &mut Map<String, Value>) -> Result<()> {
     let at = time::now();
-    let (counts, next) = focus_counts(conn, at)?;
+    let views = focus_views(conn)?;
+    let (counts, next) = focus_counts(conn, at, if scope.page == "panel" { &[] } else { &views })?;
     out.insert("tasks".into(), snapshot_rows(conn, scope)?.into());
-    out.insert("open_task_count".into(), counts.values().filter_map(Value::as_i64).sum::<i64>().into());
+    out.insert("open_task_count".into(), FOCUS.iter().map(|k| counts[*k].as_i64().unwrap()).sum::<i64>().into());
     out.insert("task_focus_counts".into(), counts.into());
+    out.insert("focus_views".into(), views.into());
     out.insert("next_deferral_at".into(), next.into());
     out.insert("tag_state".into(), super::tags::snapshot(conn)?);
     out.insert("rule_version".into(), kv::get_i64(conn, super::rules::RULE_VERSION)?.into());

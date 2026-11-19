@@ -107,7 +107,7 @@ function modelProfileFields() {
   return `<div class="model-table-head"><span>用途</span><span>AI 接入</span><span>模型</span><span>强度</span></div>${modelFields
     .map(([kind, m, e, label, tip]) => {
       const c = modelChoice(kind);
-      return `<div class="model-profile" data-model-profile="${kind}"><b>${label}${help(tip)}</b><select aria-label="${label}接入" id="cfg-${kind}-connection" data-ai-route="${kind}" >${connectionOptions(c.unconfigured ? '__unselected__' : c.connection_id || '')}</select><select aria-label="${label}模型" id="${m}" ><option value="${esc(c.model || '')}">${esc(c.model || '选择模型')}</option></select><select aria-label="${label}强度" id="${e}" ><option value="${esc(c.reasoning_effort || '')}">${esc(effortNames[c.reasoning_effort] || '默认')}</option></select><span class="route-error" id="model-status-${kind}"></span></div>`;
+      return `<div class="model-profile" data-model-profile="${kind}"><b>${label}${help(tip)}</b><select aria-label="${label}接入" id="cfg-${kind}-connection" data-ai-route="${kind}" >${connectionOptions(c.unconfigured ? '__unselected__' : c.connection_id || '')}</select><select aria-label="${label}模型" id="${m}" ><option value="${esc(c.model || '')}">${esc(c.model || '选择模型')}</option></select><select aria-label="${label}强度" id="${e}" ><option value="${esc(c.reasoning_effort || '')}">${esc(c.reasoning_effort || 'default')}</option></select><span class="route-error" id="model-status-${kind}"></span></div>`;
     })
     .join('')}`;
 }
@@ -129,18 +129,10 @@ function updateEfforts(preserve = false, only = '') {
         ? '供应商未声明强度能力；所选参数原样发送，不支持时会报错。'
         : '';
     select.innerHTML =
-      '<option value="">默认</option>' +
-      efforts
-        .map(
-          (v) =>
-            `<option value="${esc(v.reasoningEffort)}">${esc(effortNames[v.reasoningEffort] || v.reasoningEffort)}</option>`,
-        )
-        .join('');
+      '<option value="">default</option>' +
+      efforts.map(({ reasoningEffort: e }) => `<option value="${esc(e)}">${esc(e)}</option>`).join('');
     if (preserve && previous && !model) {
-      select.insertAdjacentHTML(
-        'beforeend',
-        `<option value="${esc(previous)}">${esc(effortNames[previous] || previous)}</option>`,
-      );
+      select.insertAdjacentHTML('beforeend', `<option value="${esc(previous)}">${esc(previous)}</option>`);
       select.value = previous;
     } else select.value = preserve && efforts.some((v) => v.reasoningEffort === previous) ? previous : '';
   }

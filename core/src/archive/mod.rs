@@ -94,7 +94,7 @@ pub trait Model: Send + Sync {
     /// Render and measure a request. The default counts the payload only;
     /// the real layer renders prompt and payload and keeps the render.
     fn measure(&self, request: Prepared) -> Result<Measured<Prepared>> {
-        let total = request.payload.to_string().chars().count();
+        let total = shishi_api::json::json_words(&request.payload);
         Ok(Measured::new(request, total))
     }
 
@@ -209,6 +209,9 @@ impl Audit {
 pub fn event(change: &Value) -> Value {
     let mut event = change.clone();
     event["time"] = json!(time::stamp(change["time"].as_i64().unwrap_or(0)));
+    if let Some(fields) = event["changes"].as_object_mut() {
+        fields.remove("evidence");
+    }
     event
 }
 
@@ -276,8 +279,7 @@ fn fields(names: &[&str], before: &Value, after: &Value) -> Value {
     Value::Object(out)
 }
 
-/// The task fields the model reads. Message evidence is ids only; a
-/// summary that merely cuts the description short is left out.
+/// A fallback summary only repeats the start of the description.
 pub fn task_brief(t: &Value) -> Value {
     let mut brief = pick(
         t,
@@ -292,7 +294,7 @@ pub fn task_brief(t: &Value) -> Value {
             "blocker",
             "waiting_for",
             "archive_note",
-            "evidence",
+            "number",
             "updated",
         ],
     );

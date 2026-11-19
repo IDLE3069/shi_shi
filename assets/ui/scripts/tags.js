@@ -91,13 +91,13 @@ function filterGroups() {
 function tagFilterBar() {
   const selection = tagSelection(),
     priorities = prioritySelection(),
-    active = Object.values(selection).some((a) => a.length) || priorities.length || tab !== '全部' || !!quickView;
+    active = Object.values(selection).some((a) => a.length) || priorities.length || taskScopes.length || !!quickView;
   const groups = [
     {
       name: '事项范围',
       key: 'view',
       values: [...taskFocusLabels, '已完成', '归档'],
-      selected: tab === '全部' ? [] : [tab],
+      selected: taskScopes,
     },
     ...filterGroups().map((g) => ({
       ...g,
@@ -105,15 +105,15 @@ function tagFilterBar() {
       selected: selection[g.name] || [],
     })),
   ];
-  return `<div class="tag-filters" data-ui-key="task-filters" aria-label="事项筛选" title="同类型任选其一，不同类型同时满足"><button class="tag-all ${active ? '' : 'selected'}" data-tag-clear aria-pressed="${!active}" title="清空范围、标签和等级筛选">全部</button><div class="tag-groups">${groups
+  return `<div class="tag-filters" data-ui-key="task-filters" aria-label="事项筛选" title="同组可多选，不同组同时满足"><button class="tag-all ${active ? '' : 'selected'}" data-tag-clear aria-pressed="${!active}" title="清空范围、标签和等级筛选">全部</button><div class="tag-groups">${groups
     .map(
       (g) =>
-        `<div class="tag-slot" data-filter-slot="${esc(g.key)}"><section class="tag-group" data-filter-group="${esc(g.key)}"><button class="tag-group-title" data-tag-expand="${esc(g.name)}" data-filter-key="${esc(g.key)}" aria-expanded="false"><span>${esc(g.name)}</span><small>${g.key === 'view' ? '' : g.selected.length || ''}</small><span class="tag-chevron">${icon('chevron')}</span></button><div class="tag-options">${orderedTagValues(
+        `<div class="tag-slot" data-filter-slot="${esc(g.key)}"><section class="tag-group" data-filter-group="${esc(g.key)}"><button class="tag-group-title" data-tag-expand="${esc(g.name)}" data-filter-key="${esc(g.key)}" aria-expanded="false"><span>${esc(g.name)}</span><small>${g.selected.length || ''}</small><span class="tag-chevron">${icon('chevron')}</span></button><div class="tag-options">${orderedTagValues(
           g,
         )
           .map(
             (value) =>
-              `<button class="tag-option ${g.selected.includes(value) ? 'selected' : ''} ${g.key === 'view' && tab === value ? 'active' : ''}" ${g.key === 'view' ? `data-tab="${esc(value)}"` : `data-tag-kind="${esc(g.name)}" data-tag-value="${esc(value)}"`} aria-pressed="${g.selected.includes(value)}">${esc(value)}</button>`,
+              `<button class="tag-option ${g.selected.includes(value) ? 'selected' : ''}" ${g.key === 'view' ? `data-tab="${esc(value)}"` : `data-tag-kind="${esc(g.name)}" data-tag-value="${esc(value)}"`} aria-pressed="${g.selected.includes(value)}">${esc(value)}</button>`,
           )
           .join('')}</div></section></div>`,
     )
@@ -305,7 +305,7 @@ document.addEventListener('click', async (e) => {
     if (b.hasAttribute('data-tag-clear')) {
       selectedTags = {};
       selectedPriorities = [];
-      tab = '全部';
+      taskScopes = [];
       quickView = '';
     } else {
       const kind = b.dataset.tagKind,

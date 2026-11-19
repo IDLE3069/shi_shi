@@ -39,6 +39,33 @@ function aiClock() {
   updateStatusPhase(statusPhase());
 }
 
+function focusFilterKey(f) {
+  const tags = Object.keys(f.tag_filters).sort().filter((k) => f.tag_filters[k].length)
+    .map((k) => [k, [...f.tag_filters[k]].sort()]);
+  return JSON.stringify([[...f.scope].sort(), f.view, f.query.trim().toLowerCase(), tags, [...f.priorities].sort()]);
+}
+function renderFocusViews(clicked) {
+  let current = '';
+  if (page === 'tasks') {
+    current = !quickView && taskScopes.length === 1 && taskScopes[0];
+    if (state.focus_views.some((v) => v.filters)) {
+      const key = focusFilterKey(taskFeedRequest()[1]),
+        preferred = clicked ?? (activeFocus && activeFocus.key === key && activeFocus.id),
+        match = state.focus_views.find((v) => v.id === preferred)
+          ?? state.focus_views.find((v) => v.filters && focusFilterKey(v.filters) === key);
+      if (match) current = match.id;
+      activeFocus = { id: current, key };
+    }
+  }
+  setHtml(
+    '#sidebar-context',
+    `<div class="side-section-label">关注</div>${state.focus_views.map(
+        (v) => `<button class="side-view" draggable="true" data-view="${esc(v.id)}" aria-current="${v.id === current}" data-tooltip="${esc(v.name)}"><span class="side-view-name">${esc(v.name)}</span><span>${state.task_focus_counts[v.id]}</span></button>`,
+      )
+      .join('')}`,
+  );
+}
+
 function status() {
   if (!state) return;
   syncLogUsage();
@@ -66,20 +93,11 @@ function status() {
     $('#scan-controls [data-action="scan-options"]'),
     `${state.config.enabled ? '自动' : '暂停'} · ${state.config.interval_minutes}分钟`,
   );
-  const counts = state.task_focus_counts;
   // Keep an expired wakeup until the clock tick handles it, even if another
   // state update arrives first. A cancelled deferral costs at most one refresh.
   taskNextDeferralAt = Math.min(taskNextDeferralAt, state.next_deferral_at ?? Infinity);
   const n = state.open_task_count;
-  setHtml(
-    '#sidebar-context',
-    `<div class="side-section-label">关注</div>${Object.entries(taskFocusViews)
-      .map(
-        ([view, label]) =>
-          `<button class="side-view" data-view="${view}">${label}<span>${counts[label]}</span></button>`,
-      )
-      .join('')}`,
-  );
+  renderFocusViews();
   motionText($('#nav-count'), n || '');
   if (page === 'tasks') motionText($('#page-subtitle'), `${n} 项未完成`);
   const scanLabel = state.config.enabled ? '自动扫描' : '扫描暂停',
@@ -203,12 +221,9 @@ function taskFocus(t, at = Date.now()) {
   if (t.blocker?.trim() || t.waiting_for?.trim()) return '被阻塞';
   return t.status;
 }
-function taskScopeMatches(t, scope = tab, at = Date.now()) {
-  return scope === '归档'
-    ? t.archived
-    : !t.archived &&
-        !t.merged_into &&
-        (scope === '全部' || (taskFocusLabels.includes(scope) ? taskFocus(t, at) === scope : t.status === scope));
+function taskScopeMatches(t) {
+  if (t.archived) return taskScopes.includes('归档');
+  return !taskScopes.length || taskScopes.includes(taskFocusLabels.includes(t.status) ? taskFocus(t) : t.status);
 }
 function taskQuickViewMatches(t, view = quickView, at = Date.now()) {
   return (
@@ -279,7 +294,7 @@ window.openNotifiedTask = async function (id) {
     prioritySelection();
     state = next;
     const tagsChanged = revealTaskTags(task);
-    if (!taskScopeMatches(task)) tab = task.archived ? '归档' : '全部';
+    if (!taskScopeMatches(task)) taskScopes = task.archived ? [...taskScopes, '归档'] : [];
     if (!taskQuickViewMatches(task)) quickView = '';
     if (!taskSearchMatches(task)) query = '';
     if (!$('#overlay').hidden) closeModal();
@@ -301,7 +316,7 @@ function renderTaskList() {
   const savedTagBar = rememberTagBar();
   const pane = $('.task-list'),
     detail = $('#task-detail');
-  const key = [tab, quickView, query, JSON.stringify(tagSelection()), JSON.stringify(prioritySelection())].join('|');
+  const key = [taskScopes, quickView, query, JSON.stringify(tagSelection()), JSON.stringify(prioritySelection())].join('|');
   const same = pane?.dataset.viewKey === key;
   const top = same ? pane.scrollTop : 0;
   const anchor = same
@@ -319,7 +334,7 @@ function renderTaskList() {
   syncTaskRecordPanel();
   setHtml(
     '#view',
-    `${tagFilterBar()}${list.length || taskMulti.active || tab === '归档' || !taskFeed?.done || taskFeed.error ? `<div class="split ${taskMulti.active ? 'task-bulk-layout' : ''}" data-ui-key="task-split">${taskBulkBar(list)}<div class="task-list" data-ui-key="task-list">${list.map((t, index) => taskMultiRow(`<button class="task-row state-${taskState(t).key} ${selected === t.id ? 'selected' : ''}" data-task="${t.id}" data-feed-key="${esc(t.id)}"><div class="row">${t.generation === 'pending' ? '<span class="badge blue"><span class="spin"></span>正在生成</span>' : t.generation === 'interrupted' ? '<span class="badge">已中断</span>' : t.generation === 'failed' ? '<span class="badge urgent">生成失败</span>' : ''}${extraTagBadges(t)}${t.manual ? '<span class="tiny">手动修改过</span>' : ''}</div><div class="task-title"><span class="task-number" aria-label="事项编号 ${esc(t.number)}">#${esc(t.number)}</span>${esc(t.title)}</div>${taskFocus(t) === '延后处理' ? `<div class="tiny">${esc(taskDeferralTime(t.deferred_until))} 恢复</div>` : ''}<div class="tiny" style="color:${isOverdue(t) ? 'var(--red-fg)' : 'var(--text-muted)'}">${esc(dueLabel(t))}</div><div class="task-meta"><span>${statusBadge(t)} ${handlingBadge(t.id)}${t.status === '待处理' && t.blocker?.trim() ? ' ' + esc(t.blocker) : ''}${t.status === '已完成' && t.status_changed_at ? ' · ' + esc(new Date(t.status_changed_at).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit' })) : ''}</span><span>${t.evidence_count} 条依据</span></div></button>`, t)).join('')}${taskFeedStatus()}</div><div class="detail" id="task-detail" data-ui-key="detail-${esc(selected)}" data-task-id="${esc(selected)}" data-preserve-content></div></div>` : empty(Object.keys(tagSelection()).length || prioritySelection().length ? '没有匹配的事项' : '暂无事项', Object.keys(tagSelection()).length || prioritySelection().length ? '可调整标签，或点击“全部”清空标签筛选。' : state.ai_busy ? '消息已读取，AI 正在整理。完成后事项会自动显示。' : state.pending ? `还有 ${state.pending} 条相关消息等待分析。可在消息页继续分析。` : state.config.enabled ? '暂时没有需要处理的新事项。' : '可以开启自动扫描，或手动新建事项。', state.pending ? '<button data-action="analyze">分析待处理消息</button>' : '<button data-page="settings">打开设置</button>')}`,
+    `${tagFilterBar()}${list.length || taskMulti.active || archiveOnly() || !taskFeed?.done || taskFeed.error ? `<div class="split ${taskMulti.active ? 'task-bulk-layout' : ''}" data-ui-key="task-split">${taskBulkBar(list)}<div class="task-list" data-ui-key="task-list">${list.map((t, index) => taskMultiRow(`<button class="task-row state-${taskState(t).key} ${selected === t.id ? 'selected' : ''}" data-task="${t.id}" data-feed-key="${esc(t.id)}"><div class="row">${t.generation === 'pending' ? '<span class="badge blue"><span class="spin"></span>正在生成</span>' : t.generation === 'interrupted' ? '<span class="badge">已中断</span>' : t.generation === 'failed' ? '<span class="badge urgent">生成失败</span>' : ''}${extraTagBadges(t)}${t.manual ? '<span class="tiny">手动修改过</span>' : ''}</div><div class="task-title"><span class="task-number" aria-label="事项编号 ${esc(t.number)}">#${esc(t.number)}</span>${esc(t.title)}</div>${taskFocus(t) === '延后处理' ? `<div class="tiny">${esc(taskDeferralTime(t.deferred_until))} 恢复</div>` : ''}<div class="tiny" style="color:${isOverdue(t) ? 'var(--red-fg)' : 'var(--text-muted)'}">${esc(dueLabel(t))}</div><div class="task-meta"><span>${statusBadge(t)} ${handlingBadge(t.id)}${t.status === '待处理' && t.blocker?.trim() ? ' ' + esc(t.blocker) : ''}${t.status === '已完成' && t.status_changed_at ? ' · ' + esc(new Date(t.status_changed_at).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit' })) : ''}</span><span>${t.evidence_count} 条依据</span></div></button>`, t)).join('')}${taskFeedStatus()}</div><div class="detail" id="task-detail" data-ui-key="detail-${esc(selected)}" data-task-id="${esc(selected)}" data-preserve-content></div></div>` : empty(Object.keys(tagSelection()).length || prioritySelection().length ? '没有匹配的事项' : '暂无事项', Object.keys(tagSelection()).length || prioritySelection().length ? '可调整标签，或点击“全部”清空标签筛选。' : state.ai_busy ? '消息已读取，AI 正在整理。完成后事项会自动显示。' : state.pending ? `还有 ${state.pending} 条相关消息等待分析。可在消息页继续分析。` : state.config.enabled ? '暂时没有需要处理的新事项。' : '可以开启自动扫描，或手动新建事项。', state.pending ? '<button data-action="analyze">分析待处理消息</button>' : '<button data-page="settings">打开设置</button>')}`,
     { animate: same && !taskMulti.active },
   );
   restoreTagBar(savedTagBar);

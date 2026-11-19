@@ -11,11 +11,15 @@ function releaseTaskFeed() {
   taskFeedRevision = '';
   clearHtml($('.task-list'));
 }
+function archiveOnly() {
+  return taskScopes.length === 1 && taskScopes[0] === '归档';
+}
 function taskFeedRequest() {
-  const filters = { query, tag_filters: structuredClone(tagSelection()), priorities: [...prioritySelection()] };
-  return tab === '归档'
-    ? ['archived_tasks_query', filters]
-    : ['active_tasks_query', { ...filters, scope: tab, view: taskFocusViews[quickView] || quickView }];
+  const filters = {
+    scope: [...taskScopes], view: quickView, query,
+    tag_filters: structuredClone(tagSelection()), priorities: [...prioritySelection()],
+  };
+  return [archiveOnly() ? 'archived_tasks_query' : 'active_tasks_query', filters];
 }
 function taskFeedRows() {
   const rows = taskFeed?.rows || [],
@@ -25,12 +29,13 @@ function taskFeedRows() {
 function taskFeedStatus() {
   if (!taskFeed) return '<p class="helper" role="status">正在读取事项…</p>';
   // A list that fits one page reads as before paging; longer ones show progress.
-  if (tab !== '归档' && taskFeed.done && !taskFeed.loading && !taskFeed.error && taskFeed.page <= 1) return '';
-  return `${!taskFeed.rows.length && taskFeed.done && tab === '归档' ? '<p class="helper">没有符合条件的归档事项。</p>' : ''}${pageFeedStatus(taskFeed)}`;
+  if (!archiveOnly() && taskFeed.done && !taskFeed.loading && !taskFeed.error && taskFeed.page <= 1) return '';
+  return `${!taskFeed.rows.length && taskFeed.done && archiveOnly() ? '<p class="helper">没有符合条件的归档事项。</p>' : ''}${pageFeedStatus(taskFeed)}`;
 }
 async function renderTasks() {
   const [method, params] = taskFeedRequest(),
     filter = JSON.stringify([method, params]);
+  if (filter !== taskFeedFilter) renderFocusViews();
   const revision = JSON.stringify([
     filter,
     state.tasks_revision,

@@ -1,10 +1,8 @@
-use std::io::{Read, Write};
-use std::net::TcpListener;
-
 use super::*;
 use crate::ai::native::{self, Round, Rounds};
 use crate::ai::prompt::Route;
 use crate::config::{Config, Connection as AiConnection};
+use crate::testing::serve;
 
 #[test]
 fn composer_encodes_url_bytes() {
@@ -30,43 +28,6 @@ fn job(route: &Route, root: &Path) -> Job {
 fn jwt(claims: Value) -> String {
     use base64::Engine;
     format!("h.{}.s", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string()))
-}
-
-/// Answer one request per connection in order; the raw requests come back.
-fn serve(responses: Vec<(&'static str, String)>) -> (String, std::sync::mpsc::Receiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        for (kind, body) in responses {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut seen = Vec::new();
-            let mut buf = [0u8; 65536];
-            loop {
-                let n = stream.read(&mut buf).unwrap();
-                seen.extend_from_slice(&buf[..n]);
-                let text = String::from_utf8_lossy(&seen).to_string();
-                if let Some((head, rest)) = text.split_once("\r\n\r\n") {
-                    let length = head
-                        .lines()
-                        .find_map(|l| {
-                            l.to_ascii_lowercase().strip_prefix("content-length: ").map(|v| v.parse::<usize>().unwrap())
-                        })
-                        .unwrap_or(0);
-                    if rest.len() >= length {
-                        break;
-                    }
-                }
-            }
-            tx.send(String::from_utf8_lossy(&seen).to_string()).unwrap();
-            let reply = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(reply.as_bytes()).unwrap();
-        }
-    });
-    (url, rx)
 }
 
 fn backend<'a>(home: &Path, url: &'a str) -> Backend<'a> {

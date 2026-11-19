@@ -615,13 +615,19 @@ mod invoke_pipeline {
         let fake = Fake::reply(json!({}));
         ctx.ai.set_driver(Some(fake.clone()));
         let before = ctx.db.test_read(data::ai::analysis_state).await.unwrap();
-        let call = ctx.exec.try_call("test").unwrap();
-        let request = invoke::build(&ctx, "classify", Mode::Automatic, "测试", json!({"changes": []})).await.unwrap();
-        let error = invoke::invoke(&ctx, request, &call.cancel).await.err().unwrap();
-        assert!(error.0.starts_with(crate::ai::INPUT_LIMIT_ERROR), "{}", error.0);
+        for (kind, payload) in [
+            ("classify", json!({"changes": []})),
+            ("report", json!({"report_tasks": [], "delta": []})),
+            ("report", json!({"report_tasks": [{"id": "t"}], "delta": [{"task_id": "t"}]})),
+        ] {
+            let call = ctx.exec.try_call("test").unwrap();
+            let request = invoke::build(&ctx, kind, Mode::Automatic, "测试", payload).await.unwrap();
+            let error = invoke::invoke(&ctx, request, &call.cancel).await.err().unwrap();
+            assert!(error.0.starts_with(crate::ai::INPUT_LIMIT_ERROR), "{}", error.0);
+        }
         assert_eq!(fake.calls(), 0);
         assert_eq!(calls(&ctx).await, 0);
-        assert_eq!(kinds(&ctx).await, ["ai_rejected"]);
+        assert_eq!(kinds(&ctx).await, ["ai_rejected"; 3]);
         assert_eq!(ctx.db.test_read(data::ai::analysis_state).await.unwrap(), before);
     }
 
@@ -779,6 +785,105 @@ mod invoke_pipeline {
     }
 
     #[tokio::test]
+    async fn large_reports_send_each_batch_within_budget_and_keep_its_own_request_id() {
+        use crate::archive::{layer, reports, Mode as ReportMode};
+        let ctx = ctx(80_000).await;
+        ctx.db
+            .test_write(|c| {
+                for i in 0..6 {
+                    let first = format!("初稿{i}{}", "甲".repeat(13_000));
+                    let last = format!("修订{i}{}", "乙".repeat(16_000));
+                    let t = data::tasks::edit(
+                        c,
+                        &json!({"task": {"title": format!("合成事项{i}"), "description": first}}),
+                    )?;
+                    data::tasks::edit(
+                        c,
+                        &json!({"task": {"id": t["id"], "updated": t["updated"], "description": last}}),
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let layer = layer::model(&ctx).await.unwrap();
+        let fake = Fake::new((1..=12).map(|i| Step::Reply(
+            json!({"summary": format!("已汇总第{i}批"), "completed": [], "attention": [], "next_steps": []}), json!({})
+        )).collect());
+        ctx.ai.set_driver(Some(fake.clone()));
+        let r = reports::report(&ctx, layer.as_ref(), "早报", ReportMode::Manual).await.unwrap();
+        assert!(layer.measure(reports::request(&r, ReportMode::Manual)).unwrap().total > 200_000);
+        let n = fake.calls();
+        assert!(n >= 3);
+        assert_eq!(r["ai_summary"]["summary"], format!("已汇总第{n}批"));
+        assert_eq!(r["delta"].as_array().unwrap().len(), 12);
+        let logs = logs(&ctx).await;
+        let starts: Vec<_> = logs.iter().filter(|r| r["kind"] == "ai_start").map(|r| &r["detail"]).collect();
+        assert_eq!(starts.len(), n);
+        assert!(starts.iter().all(|d| d["input_sizes"]["total_input_chars"].as_u64().unwrap() <= 80_000));
+        assert_eq!(
+            starts.iter().map(|d| d["request_id"].as_str().unwrap()).collect::<std::collections::HashSet<_>>().len(),
+            n
+        );
+        let seen = fake.seen.lock().unwrap();
+        for (i, (_, prompt)) in seen.iter().enumerate().skip(1) {
+            assert!(prompt.contains(&format!("已汇总第{i}批")) && prompt.contains("合成一份完整报表"));
+        }
+        for i in 0..6 {
+            for label in [format!("初稿{i}"), format!("修订{i}")] {
+                assert!(seen.iter().any(|(_, prompt)| prompt.contains(&label)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_report_tasks_and_changes_are_sent_alone_and_the_next_batch_continues() {
+        use crate::archive::{layer, reports, Mode as ReportMode, REPORT_CURSOR};
+        let ctx = ctx(80_000).await;
+        let replies = (1..=4).map(|i| {
+            let value = json!({"summary": format!("第{i}批"), "completed": [], "attention": [], "next_steps": []});
+            let reply = json!({"choices": [{"message": {"role": "assistant", "content": value.to_string()}, "finish_reason": "stop"}]});
+            ("application/json", reply.to_string())
+        }).collect();
+        let (url, requests) = crate::testing::serve(replies);
+        ctx.config
+            .update(&ctx.db, move |c| {
+                c.ai_connections[0].base_url = url;
+                c.ai_connections[0].stream = false;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        ctx.db
+            .test_write(|c| {
+                let t = data::tasks::edit(c, &json!({"task": {"title": "合成长事项", "description": "初稿"}}))?;
+                let t = data::tasks::edit(
+                    c,
+                    &json!({"task": {
+                        "id": t["id"], "updated": t["updated"], "description": "甲".repeat(82_000)
+                    }}),
+                )?;
+                data::tasks::edit(c, &json!({"task": {"id": t["id"], "updated": t["updated"], "status": "处理中"}}))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let layer = layer::model(&ctx).await.unwrap();
+        let r = reports::report(&ctx, layer.as_ref(), "手动报表", ReportMode::Manual).await.unwrap();
+        assert_eq!(r["summary_status"], "done");
+        assert_eq!(r["ai_summary"]["summary"], "第4批");
+        assert_eq!(ctx.db.test_read(|c| data::kv::get_i64(c, REPORT_CURSOR)).await.unwrap(), r["audit_until"]);
+        assert_eq!(calls(&ctx).await, 4);
+        let seen: Vec<_> = requests.try_iter().collect();
+        let oversized: Vec<_> =
+            seen.iter().map(|r| r.split_once("\r\n\r\n").unwrap().1.chars().count() > 80_000).collect();
+        assert_eq!(oversized, [true, false, true, false]);
+        let full = "甲".repeat(82_000);
+        assert!(seen[0].contains(&full) && seen[2].contains(&full));
+        assert!(seen[2].contains("初稿") && seen[3].contains("第3批"));
+    }
+
+    #[tokio::test]
     async fn archive_layer_picks_the_mode_and_sends_the_measured_render() {
         use crate::archive::layer as model;
         use crate::archive::Prepared;
@@ -792,7 +897,7 @@ mod invoke_pipeline {
         let request = Prepared { purpose: "report", payload: json!({"_trigger": "manual_report", "tasks": []}) };
         let measured = layer.measure(request).unwrap();
         // The rule text alone exceeds the payload size.
-        assert!(measured.total > measured.request.payload.to_string().chars().count());
+        assert!(measured.total > shishi_api::json::json_words(&measured.request.payload));
         assert!(measured.total <= 400_000);
         // The measured render is what is sent: a later edit does not re-render it.
         let before = ctx.config.get().model_choice("report").model;

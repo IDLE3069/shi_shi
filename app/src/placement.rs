@@ -11,6 +11,24 @@ pub struct Rect {
     pub bottom: i32,
 }
 
+#[cfg(windows)]
+impl From<windows_sys::Win32::Foundation::RECT> for Rect {
+    fn from(r: windows_sys::Win32::Foundation::RECT) -> Self {
+        Self { left: r.left, top: r.top, right: r.right, bottom: r.bottom }
+    }
+}
+
+/// All visible notices use the same monitor scale, including windows created before a reconnect.
+pub fn notice_slot(work: Rect, size: (f64, f64), scale: f64, index: usize) -> Option<Rect> {
+    let gap = (10. * scale).round() as i32;
+    let right = work.right - gap;
+    let width = ((size.0 * scale).round() as i32).min(right - work.left - gap);
+    let height = ((size.1 * scale).round() as i32).min(work.bottom - work.top - 2 * gap);
+    let bottom = work.bottom - gap - index as i32 * (height + gap);
+    let top = bottom - height;
+    (width > 0 && height > 0 && top >= work.top + gap).then_some(Rect { left: right - width, top, right, bottom })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Edge {
     Left,

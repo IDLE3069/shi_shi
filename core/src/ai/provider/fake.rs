@@ -33,6 +33,7 @@ pub fn job(route: Route, config: Config, prepared: Prepared, root: PathBuf) -> J
     Job {
         kind: route.kind.clone(),
         route,
+        input_limit: Some(config.max_input_chars),
         config,
         prepared,
         session: None,

@@ -108,7 +108,7 @@ function motionKey(el) {
     'data-page',
     'data-handle',
     'data-action',
-    'data-prompt-section',
+    'data-settings-target',
   ])
     if (el.hasAttribute(name)) return el.tagName + ':' + name + ':' + el.getAttribute(name);
   return '';
@@ -275,7 +275,7 @@ new MutationObserver((records) => {
     if (!el?.isConnected || el.closest('[data-motion-ghost],.ai-live-output,[data-live-line],input,textarea,select'))
       continue;
     const target = el.closest(
-      '#page-subtitle,#nav-count,.side-pending,.usage-line b,.report-counts b,.advice-status,.summary-lead,.memory-prose,#connection-status,#connection-models,#connection-candidates,#source-candidates,#settings-save-status,#plugin-drop-hint,#inbox-summary',
+      '#page-subtitle,#nav-count,.side-pending,.usage-line b,.report-counts b,.advice-status,.summary-lead,#connection-status,#connection-models,#connection-candidates,#source-candidates,#settings-save-status,#plugin-drop-hint,#inbox-summary',
     );
     if (
       target &&

@@ -7,6 +7,14 @@ use std::sync::mpsc;
 
 const KEY: &str = "synthetic-key";
 
+#[test]
+fn input_words_count_letters_and_digits_without_punctuation_or_transport_escapes() {
+    assert_eq!(crate::json::words("中A文b１2，！🙂 \n"), 6);
+    let message = json!({"role":"user","content":"甲A\n乙2，🙂"});
+    assert_eq!(message_input_chars(&message), 4 + 4 + 7 + 4);
+    assert_eq!(body_input_chars(&json!({"messages":[message]})), 8 + 4 + 4 + 7 + 4);
+}
+
 fn schema() -> Value {
     json!({"type":"object","additionalProperties":false,"properties":{"ok":{"type":"boolean"}},"required":["ok"]})
 }
@@ -232,6 +240,17 @@ fn run_client(client: &Client) -> Result<AnalysisOutput, ApiError> {
         continuation_limit: None,
     };
     client.analyze_with_events(request, true, &mut |_| {})
+}
+
+#[test]
+fn bad_request_keeps_the_dotted_reasoning_parameter() {
+    let body = json!({"error":{"code":"invalid_value","param":"reasoning.effort"}}).to_string();
+    let (url, _seen) = serve(format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    ));
+    let error = run_client(&Client::new(&url, Wire::Chat).unwrap()).unwrap_err();
+    assert_eq!((error.status, error.parameter), (Some(400), Some("reasoning.effort")));
 }
 
 #[test]

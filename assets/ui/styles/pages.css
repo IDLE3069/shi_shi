@@ -451,9 +451,6 @@
   border: 0;
   background: var(--surface);
 }
-#prompt-content[readonly] {
-  color: var(--text-secondary);
-}
 .prompt-history {
   margin-top: 18px;
   border: 1px solid var(--border-strong);
@@ -488,7 +485,9 @@
 .prompt-workspace {
   max-width: var(--page-w);
 }
-.prompt-current #prompt-content[readonly] {
+.prompt-current #prompt-content[readonly],
+#memory-text[readonly] {
+  color: var(--text-secondary);
   resize: none;
   background: transparent;
   border-color: transparent;
@@ -496,65 +495,26 @@
   padding-left: 0;
   padding-right: 0;
 }
-.memory-intro {
-  margin: 0 0 24px;
+.memory-toolbar {
+  margin-bottom: 8px;
 }
-.memory-intro > p {
-  line-height: 1.8;
-  color: var(--text-secondary);
+#memory-count {
+  margin-right: auto;
 }
-.memory-prose {
-  white-space: pre-wrap;
-  line-height: 1.8;
-  overflow-wrap: anywhere;
-}
-.memory-editor textarea {
+#memory-text {
+  height: min(50vh, calc(100vh - 280px), 32rem);
+  min-height: 4em;
   width: 100%;
-  margin-top: 6px;
+  resize: none;
   line-height: 1.7;
-}
-.memory-editor-foot {
-  position: sticky;
-  bottom: 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  background: var(--surface-raised);
-  padding: 14px 0 0;
 }
 .memory-over-limit {
   color: var(--red-fg);
 }
-.memory-card-head {
-  margin-bottom: 14px;
-}
-.memory-heading {
-  display: flex;
-  align-items: baseline;
-  gap: 12px;
-  flex: 1;
-  min-width: 0;
-}
-.memory-heading h2 {
-  margin: 0;
-  flex: none;
-}
-.memory-heading > .memory-caption {
-  font-size: var(--fs-caption);
-  line-height: 1.7;
-  color: var(--text-muted);
-  font-weight: 400;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.memory-card-head > button,
 .about-head > h2,
 .about-version {
   flex: none;
 }
-.memory-page > .box,
 .sources-page,
 .prompt-workspace > .box {
   min-height: 80px;

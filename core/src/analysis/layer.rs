@@ -315,7 +315,7 @@ fn result_chars(result: &ToolResult) -> std::result::Result<usize, ToolFailure> 
     let (message, images) = result.clone().messages(PROBE).map_err(|_| ToolFailure::new(ToolFailureKind::Failed))?;
     let empty = json!({"role": "tool", "tool_call_id": PROBE, "content": ""});
     let mic = shishi_api::openai::message_input_chars;
-    let images = if images.is_empty() { 0 } else { mic(&json!({"role": "user", "content": images})) + 1 };
+    let images = if images.is_empty() { 0 } else { mic(&json!({"role": "user", "content": images})) };
     Ok(mic(&message).saturating_sub(mic(&empty)) + images)
 }
 

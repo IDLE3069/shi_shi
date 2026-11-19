@@ -8,6 +8,7 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Map, Value};
 
 use super::{audit, kv, rows, Db};
+use crate::archive::layer::HistoryPage;
 use crate::archive::run::{Batch, Material, Page, PAGE};
 use crate::archive::{
     new_id, Attempt, Audit, MorningJob, ARCHIVE_CURSOR, ATTEMPT_DAY, LEARNING_CURSOR, MORNING_RECOVERY_ERROR,
@@ -108,20 +109,17 @@ pub(super) fn audits(conn: &Connection, tail: &str) -> Result<Vec<Audit>> {
     let sql =
         format!("SELECT seq, time, kind, task_id, detail, change_summary, before, after FROM task_audit WHERE {tail}");
     let mut stmt = conn.prepare_cached(&sql)?;
-    let parse = |text: Option<String>| text.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
-    let rows = stmt.query_map([], |r| {
-        Ok(Audit {
-            seq: r.get(0)?,
-            time: r.get(1)?,
-            kind: r.get(2)?,
-            task_id: r.get(3)?,
-            detail: r.get(4)?,
-            change_summary: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
-            before: parse(r.get(6)?),
-            after: parse(r.get(7)?),
-        })
-    })?;
+    let rows = stmt.query_map([], audit_row)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+fn audit_row(r: &rusqlite::Row) -> rusqlite::Result<Audit> {
+    let parse = crate::tasks::query::snapshot_json;
+    Ok(Audit {
+        seq: r.get("seq")?, time: r.get("time")?, kind: r.get("kind")?, task_id: r.get("task_id")?,
+        detail: r.get("detail")?, change_summary: r.get::<_, Option<String>>("change_summary")?.unwrap_or_default(),
+        before: parse(r.get("before")?), after: parse(r.get("after")?),
+    })
 }
 
 pub(crate) fn max_seq(conn: &Connection) -> Result<i64> {
@@ -135,7 +133,7 @@ fn scope_since(conn: &Connection) -> Result<i64> {
     Ok((conn.query_row(sql, [], |r| r.get::<_, i64>(0))? - 1).max(0))
 }
 
-/// Tasks archiving and reports still look at, as a condition on `tasks`:
+/// Tasks an archive still looks at, as a condition on `tasks`:
 /// unmerged, not generating, and either open or edited after `since` by
 /// something other than the archive itself.
 fn scope_sql(since: i64) -> String {
@@ -209,6 +207,7 @@ pub(crate) fn load(conn: &Connection) -> Result<Material> {
         cursor,
         max_seq: 0,
         since,
+        history_since: conn.query_row("SELECT coalesce(max(finished),0) FROM archive_attempts WHERE status = 'succeeded'", [], |r| r.get(0))?,
         evidence: Vec::new(),
         exhausted: false,
         total: 0,
@@ -545,6 +544,96 @@ impl Db {
     /// Hourly retention of what archiving has processed.
     pub async fn prune_archive(&self, days: u32, at: i64) -> Result<bool> {
         self.write(move |tx| prune(tx, days, at)).await
+    }
+
+    /// The time and row key stay fixed while a long record is read in pieces.
+    pub(crate) fn archive_history_page(
+        &self,
+        id: String,
+        updated: i64,
+        mut page: HistoryPage,
+        horizon: i64,
+        max_seq: i64,
+        token: usize,
+        budget: Option<usize>,
+    ) -> Result<Option<(String, Option<HistoryPage>)>> {
+        self.read_blocking(move |conn| {
+            if !conn.prepare_cached("SELECT 1 FROM tasks WHERE id=?1 AND updated=?2")?.exists(params![id, updated])? {
+                crate::bail!("事项已变更，本批历史补查已结束");
+            }
+            let updates = format!(
+                "SELECT seq, time, kind, task_id, detail, change_summary, before, after, seq AS row_key
+                FROM task_audit WHERE task_id=?1 AND {EVIDENCE} AND time BETWEEN ?2 AND ?3
+                AND (time,seq) <= (?4,?5) AND seq<=?6 ORDER BY time DESC,seq DESC LIMIT 21"
+            );
+            let messages = "SELECT m.time, m.rowid AS row_key, m.sender, m.text,
+                (SELECT group_concat(role) FROM task_evidence WHERE task_id=?1 AND message_id=m.id) AS roles
+                FROM messages m WHERE m.id IN (SELECT message_id FROM task_evidence WHERE task_id=?1)
+                AND m.withdrawn=0 AND m.time BETWEEN ?2 AND ?3 AND (m.time,m.rowid) <= (?4,?5)
+                AND m.updated_at<=?6 ORDER BY m.time DESC,m.rowid DESC LIMIT 21";
+            let mut stmt = conn.prepare_cached(if page.updates { &updates } else { messages })?;
+            let mut rows = stmt.query(params![
+                id,
+                page.since,
+                page.until,
+                page.at,
+                page.key,
+                if page.updates { max_seq } else { horizon }
+            ])?;
+            let mut records = Vec::<String>::new();
+            let render = |records: &[String], more| {
+                if more { json!({"records":records,"next_cursor":token}) } else { json!({"records":records}) }
+                    .to_string()
+            };
+            let fits = |text: &str| crate::analysis::context::page_fits(text, budget);
+            while let Some(r) = rows.next()? {
+                let at = r.get("time")?;
+                let key = r.get("row_key")?;
+                if (at, key) != (page.at, page.key) {
+                    page.offset = 0;
+                }
+                (page.at, page.key) = (at, key);
+                if records.len() == 20 {
+                    return Ok(Some((render(&records, true), Some(page))));
+                }
+                let text = if page.updates {
+                    crate::archive::event(&audit_row(r)?.change()).to_string()
+                } else {
+                    format!(
+                        "{} [{}] {}：{}",
+                        time::stamp(at),
+                        r.get::<_, String>("roles")?,
+                        r.get::<_, String>("sender")?,
+                        r.get::<_, String>("text")?
+                    )
+                };
+                records.push(text.chars().skip(page.offset).take(crate::analysis::context::PAGE).collect());
+                let last = records.len() - 1;
+                if !fits(&render(&records, true)) {
+                    let last_page = render(&records, false);
+                    if fits(&last_page) && rows.next()?.is_none() {
+                        return Ok(Some((last_page, None)));
+                    }
+                    let full = std::mem::take(&mut records[last]);
+                    let boundaries: Vec<_> = full.char_indices().map(|(at, _)| at).chain([full.len()]).collect();
+                    let end = boundaries
+                        .partition_point(|&end| {
+                            records[last] = full[..end].to_string();
+                            fits(&render(&records, true))
+                        })
+                        .saturating_sub(1);
+                    if end == 0 {
+                        records.pop();
+                        return Ok((!records.is_empty()).then(|| (render(&records, true), Some(page))));
+                    }
+                    records[last] = full[..boundaries[end]].to_string();
+                    page.offset += end;
+                    return Ok(Some((render(&records, true), Some(page))));
+                }
+            }
+            let text = render(&records, false);
+            Ok(fits(&text).then_some((text, None)))
+        })
     }
 
     /// The base of an archive batch with its first evidence page.

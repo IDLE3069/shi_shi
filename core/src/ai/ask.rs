@@ -76,7 +76,7 @@ pub async fn ask_fitted(
     };
     let Some((n, (ids, mut invocation))) = fitted else { return Ok(None) };
     invocation.payload["_batch_metrics"] = json!({"selected": n, "initial_selected": count,
-        "total_input_chars": invocation.prepared.total, "max_input_chars": config.max_input_chars});
+        "unit": "words", "total_input_chars": invocation.prepared.total, "max_input_chars": config.max_input_chars});
     Ok(Some((n, send(ctx, kind, inputs, ids, invocation).await?)))
 }
 

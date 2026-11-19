@@ -81,16 +81,17 @@ function usageCard(d) {
   return `<div class="usage-chips">${u.partial ? '<span>已返回部分用量，后续未确认部分仍记为未知</span>' : ''}<span>总计 <b>${(u.input_tokens + u.output_tokens).toLocaleString()}</b></span><span>输入 ${u.input_tokens.toLocaleString()}</span><span>输出 ${u.output_tokens.toLocaleString()}</span><span>缓存命中 ${cached == null ? '未提供' : cached.toLocaleString()}</span>${speed}</div>`;
 }
 function requestBatchSummary(detail) {
-  const batch = detail.batch;
+  const batch = detail.batch ?? detail.input_sizes;
   if (!batch) return '';
   const count = (value) => Number.isSafeInteger(value) && value >= 0,
     format = (value) => value.toLocaleString('zh-CN'),
+    unit = batch.unit === 'words' ? '字' : '字符',
     total = batch.total_input_chars,
     limit = batch.max_input_chars,
     parts = [];
-  if (count(total)) parts.push(`请求占用 ${format(total)}${count(limit) && limit > 0 ? '/' + format(limit) : ''} 字符`);
+  if (count(total)) parts.push(`请求占用 ${format(total)}${count(limit) && limit > 0 ? '/' + format(limit) : ''} ${unit}`);
   if (count(batch.selected)) parts.push(`本批 ${batch.selected}${count(batch.pending) ? '/' + batch.pending : ''} 条`);
-  if (count(batch.message_chars)) parts.push(`消息 ${format(batch.message_chars)} 字符`);
+  if (count(batch.message_chars)) parts.push(`消息 ${format(batch.message_chars)} ${unit}`);
   const reduced = batch.reduced_by ?? [],
     reasons = [];
   if (reduced.includes('reply_context')) reasons.push('精简引用摘录');
@@ -196,7 +197,7 @@ function logEntry(a) {
     title = state.ai_busy && Math.abs(a.time - state.ai_started) < 2000 ? '正在分析' : '分析开始 · 尚无结束记录';
     body =
       (d.batch ? '' : (d.messages ? `本批 ${d.messages} 条消息` : '文本整理请求') + ' · ') +
-      `${aiModelLabel(d)} · ${d.reasoning_effort || '默认'} 推理`;
+      `${aiModelLabel(d)} · ${d.reasoning_effort || 'default'} 推理`;
   }
   if (a.kind === 'ai_success') {
     title = d.analysis_degraded
@@ -204,7 +205,7 @@ function logEntry(a) {
       : d.kind === 'classify'
         ? 'AI 已返回分析结果'
         : 'AI 分析完成';
-    body = `${aiModelLabel(d)} · ${d.reasoning_effort || '默认'} 推理 · ${Math.round(d.elapsed_ms / 1000)} 秒`;
+    body = `${aiModelLabel(d)} · ${d.reasoning_effort || 'default'} 推理 · ${Math.round(d.elapsed_ms / 1000)} 秒`;
   }
   if (a.kind === 'ai_cancelled') {
     title = 'AI 分析已中断';
@@ -316,7 +317,7 @@ function logEntry(a) {
     : '';
   const tokenLine =
     ['ai_success', 'ai_failed', 'ai_cancelled'].includes(a.kind) || a.kind === 'handling_round'
-      ? `<div class="event-description">${a.kind === 'ai_failed' ? esc(aiModelLabel(d) + ' · ' + (d.reasoning_effort || '默认') + ' 推理 · ' + Math.round(d.elapsed_ms / 1000) + ' 秒') : ''}</div>` +
+      ? `<div class="event-description">${a.kind === 'ai_failed' ? esc(aiModelLabel(d) + ' · ' + (d.reasoning_effort || 'default') + ' 推理 · ' + Math.round(d.elapsed_ms / 1000) + ' 秒') : ''}</div>` +
         usageCard(d)
       : '';
   return `<article data-event-key="${esc(a.id)}" data-feed-key="${esc(a.id)}" class="event ${bad ? 'event-error' : ''}"><div class="event-dot"></div><div class="event-content"><div class="event-heading"><b>${esc(title)}</b><time>${esc(date(a.time))}</time>${a.audit && ['manual_edit', 'manual_status', 'manual_ai_edit', 'merge'].includes(a.kind) ? `<button class="quiet" data-undo="${esc(a.id)}">撤销</button>` : ''}</div>${a.task_number != null ? `<div class="event-task">#${esc(a.task_number)} ${esc(a.task_title)}</div>` : ''}<div class="event-description">${esc(body)}${batch}</div>${tokenLine}${d.thread_id && ['codex', 'dsh'].includes(d.source?.driver) ? `<button class="quiet" data-analysis-session="${esc(d.thread_id)}" data-session-driver="${esc(d.source.driver)}">${d.source.driver === 'dsh' ? '在 DSH 查看会话' : '在 Codex 查看'} ↗</button>` : ''}${d.run_id && a.kind.startsWith('tool_call_') ? `<button data-tool-log-run="${esc(d.run_id)}">查看调用详情</button>` : ''}${d.request_id && !a.kind.startsWith('tool_call_') && a.kind !== 'ai_rejected' ? `<button class="quiet" data-trace="${esc(d.request_id)}">查看提示词与输出 ↗</button>` : ''}${a.audit ? changeRows(a) : ''}</div></article>`;

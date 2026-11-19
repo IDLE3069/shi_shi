@@ -50,7 +50,7 @@ function handlingChip(pick) {
   if (c.driver === 'codex') return `<button type="button" class="handling-chip" data-handling-menu="model" aria-haspopup="listbox" aria-expanded="false"><span>${esc(c.name)}</span>${icon('chevron')}</button>`;
   const m = c?.models.find((m) => m.model === pick.model);
   const model = m ? m.displayName || m.model : pick.model || '默认模型';
-  const effort = pick.effort ? effortNames[pick.effort] || pick.effort : '默认强度';
+  const effort = pick.effort || 'default';
   const title = [c?.name || handlingClient(c), m ? handlingModelName(m) : model, effort].join(' · ');
   return `<button type="button" class="handling-chip" data-handling-menu="model" aria-haspopup="listbox" aria-expanded="false" title="${esc(title)}，仅本次会话生效"><span>${esc(c.name)} · ${esc(model)}</span><small>${esc(effort)}</small>${icon('chevron')}</button>`;
 }
@@ -117,7 +117,7 @@ function handlingMenuItems(kind, host, query) {
   const efforts = ['', ...handlingEfforts(pick)]
     .map(
       (e) =>
-        `<button type="button" data-effort="${esc(e)}" aria-pressed="${e === (pick.effort || '')}">${esc(e ? effortNames[e] || e : '默认')}</button>`,
+        `<button type="button" data-effort="${esc(e)}" aria-pressed="${e === (pick.effort || '')}">${esc(e || 'default')}</button>`,
     )
     .join('');
   return `${groups}<div class="handling-menu-efforts" role="group" aria-label="推理强度"><span>推理强度</span>${efforts}</div>`;

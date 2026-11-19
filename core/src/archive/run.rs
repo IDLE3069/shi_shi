@@ -35,6 +35,7 @@ pub struct Material {
     pub(crate) cursor: i64,
     pub(crate) max_seq: i64,
     pub(crate) since: i64,
+    pub(crate) history_since: i64,
     /// Evidence rows of tasks in scope after the cursor read so far, oldest first.
     pub(crate) evidence: Vec<Audit>,
     /// No further evidence rows exist after the read ones.
@@ -142,10 +143,23 @@ pub fn build(m: &Material, attempt: &Attempt, mode: Mode, at: i64, count: usize,
         None => taken.last().map_or(m.cursor, |a| a.seq),
     };
     let mut rows = Vec::new();
+    let mut automatic = BTreeMap::<i64, BTreeMap<&str, usize>>::new();
     let mut learning = Vec::new();
     for a in taken {
-        let event = super::event(&a.change());
-        rows.push(json!({"audit_index": a.seq, "evidence_id": format!("audit:{}", a.seq), "event": event}));
+        if matches!(
+            a.kind.as_str(),
+            "manual_edit"
+                | "manual_status"
+                | "manual_ai_edit"
+                | "manual_archive"
+                | "merge"
+                | "undo"
+                | "generation_done"
+        ) {
+            rows.push(json!({"audit_index": a.seq, "evidence_id": format!("audit:{}", a.seq), "event": super::event(&a.change())}));
+        } else if let Some(t) = m.linked.get(&a.task_id) {
+            *automatic.entry(t.number).or_default().entry(&a.kind).or_default() += 1;
+        }
         if a.learning() {
             learning.push(a.seq);
         }
@@ -179,6 +193,7 @@ pub fn build(m: &Material, attempt: &Attempt, mode: Mode, at: i64, count: usize,
         .collect();
     let mut payload = json!({
         "evidence": rows,
+        "automatic_changes": automatic,
         "archive_note_sources": notes,
         "learning_evidence_ids": learning.iter().map(|s| format!("audit:{s}")).collect::<Vec<_>>(),
         "coverage": {"status_counts": m.status_counts, "remaining_events": remaining, "omitted_tasks": 0},
@@ -190,7 +205,7 @@ pub fn build(m: &Material, attempt: &Attempt, mode: Mode, at: i64, count: usize,
         "current_tasks": current.iter().map(|t| task_brief(&t.payload())).collect::<Vec<_>>(),
         "_archived_memory": m.memory.text,
         "_temporary_memory": m.temporary.text,
-        "_local_context": {"archived_memory": {"revision": m.memory.revision}, "memory": {"writable": false}},
+        "_local_context": {"since": m.history_since.max(at - 7 * time::DAY), "until": at, "max_seq": m.max_seq, "archived_memory": {"revision": m.memory.revision}, "memory": {"writable": false}},
         "memory": {"writable": false},
         "_context_frozen": true,
     });
@@ -357,14 +372,14 @@ pub async fn archive(
     }
     let (trigger, day) = (trigger.to_string(), super::business_day(&config, at));
     let attempt = ctx.db.start_archive(trigger, day, at, existing).await?;
-    let result = batches(ctx, model, &attempt, mode, at).await;
+    let result = batches(ctx, model, &attempt, mode).await;
     if let Err(e) = &result {
         fail_attempt(ctx, &attempt.id, &e.0).await?;
     }
     result
 }
 
-async fn batches(ctx: &Ctx, model: &dyn Model, attempt: &Attempt, mode: Mode, at: i64) -> Result<Value> {
+async fn batches(ctx: &Ctx, model: &dyn Model, attempt: &Attempt, mode: Mode) -> Result<Value> {
     let config = ctx.config.get();
     let started = Instant::now();
     let deadline = Duration::from_secs(config.ai_timeout_seconds.max(1));
@@ -376,7 +391,7 @@ async fn batches(ctx: &Ctx, model: &dyn Model, attempt: &Attempt, mode: Mode, at
         if started.elapsed() >= deadline {
             crate::bail!("{TOTAL_TIMEOUT_NEXT}");
         }
-        let (batch, request) = fit(ctx, model, attempt, mode, at, config.max_input_chars).await?;
+        let (batch, request) = fit(ctx, model, attempt, mode, time::now(), config.max_input_chars).await?;
         ctx.db.set_archive_remaining(attempt.id.clone(), batch.evidence.len() as i64 + batch.remaining).await?;
         let Some(request) = request else {
             if batch.remaining > 0 {

@@ -1,68 +1,33 @@
 //! Reports: the manual report and the morning report.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::{event, task_brief, Measured, Mode, Model, MorningJob, Prepared};
+use super::{event, task_brief, Mode, Model, MorningJob, Prepared};
 use crate::ai::prompt::require_purpose;
+use crate::analysis::batch::fit_prefix;
 use crate::{exec, time, Ctx, Error, Result};
 
-/// Days of changes a report keeps however large its delta grows.
-const KEPT_DAYS: i64 = 7;
+/// Only tasks and changes can be split between report calls.
+pub(crate) fn row_count(payload: &Value) -> usize {
+    ["report_tasks", "delta"].into_iter().filter_map(|key| payload[key].as_array()).map(Vec::len).sum()
+}
 
-/// What the report model reads: the tasks and the delta from row `from` on.
+/// What the report model reads: the selected tasks and their new changes.
 /// It cannot read messages, so it gets no message ids.
-pub fn request(r: &Value, mode: Mode, from: usize) -> Prepared {
+pub fn request(r: &Value, mode: Mode) -> Prepared {
     let rows = |section: &str| r[section].as_array().map_or(&[][..], Vec::as_slice);
-    let tasks: Vec<Value> = rows("tasks").iter().map(|t| without(task_brief(t), "evidence")).collect();
-    let delta: Vec<Value> = rows("delta")
-        .iter()
-        .skip(from)
-        .map(|e| {
-            let mut e = event(e);
-            e["changes"] = without(e["changes"].take(), "evidence");
-            e
-        })
-        .collect();
+    let tasks: Vec<Value> = rows("tasks").iter().map(task_brief).collect();
+    let delta: Vec<Value> = rows("delta").iter().map(event).collect();
     Prepared {
         purpose: "report",
         payload: json!({
             "report_tasks": tasks, "delta": delta, "label": r["label"], "time": time::stamp(time::now()),
             "_trigger": if mode == Mode::Manual { "manual_report" } else { "scheduled_report" },
         }),
-    }
-}
-
-fn without(mut v: Value, key: &str) -> Value {
-    if let Some(o) = v.as_object_mut() {
-        o.remove(key);
-    }
-    v
-}
-
-/// The request with as much of the newest delta as fits `limit`: whole days
-/// go oldest first, never the last [`KEPT_DAYS`]. One still too large is
-/// sent as it is, for the call layer to reject and log. Returns it with the
-/// number of rows left out.
-fn fit(model: &dyn Model, r: &Value, mode: Mode, limit: usize) -> Result<(Measured<Prepared>, usize)> {
-    let days: Vec<String> = r["delta"]
-        .as_array()
-        .map_or(&[][..], Vec::as_slice)
-        .iter()
-        .map(|e| time::date_from(e["time"].as_i64().unwrap_or(0)))
-        .collect();
-    let kept = time::date_from(r["time"].as_i64().unwrap_or(0) - (KEPT_DAYS - 1) * time::DAY);
-    let mut from = 0;
-    loop {
-        let measured = model.measure(request(r, mode, from))?;
-        match days.get(from) {
-            Some(day) if measured.total > limit && *day < kept => {
-                from += days[from..].iter().take_while(|d| *d == day).count();
-            }
-            _ => return Ok((measured, from)),
-        }
     }
 }
 
@@ -87,22 +52,56 @@ pub fn apply(r: &mut Value, result: Result<Value>) {
 
 async fn summarize(ctx: &Ctx, model: &dyn Model, mut r: Value, mode: Mode) -> Result<Value> {
     let Some(_release) = exec::Flag::claim(&ctx.archive.summary_busy) else { return Ok(r) };
-    let result = match super::archive_blocks(ctx).await {
-        Err(e) => Err(e),
-        Ok(()) => {
-            let config = ctx.config.get();
-            let timeout = Duration::from_secs(config.ai_timeout_seconds.max(1));
-            match fit(model, &r, mode, config.max_input_chars) {
-                Ok((measured, omitted)) => {
-                    if omitted > 0 {
-                        r["delta_omitted"] = json!(omitted);
-                    }
-                    super::ask(ctx, model, measured, timeout).await
-                }
-                Err(e) => Err(e),
+    let result = async {
+        super::archive_blocks(ctx).await?;
+        let config = ctx.config.get();
+        let limit = config.max_input_chars;
+        let timeout = Duration::from_secs(config.ai_timeout_seconds.max(1));
+        let mut base = {
+            let measured = model.measure(request(&r, mode))?;
+            if measured.total <= limit || row_count(&measured.request.payload) <= 1 {
+                return super::ask(ctx, model, measured, timeout).await;
+            }
+            measured.request
+        };
+        let started = Instant::now();
+        let all_tasks = base.payload["report_tasks"].take();
+        let mut all_delta = base.payload["delta"].take();
+        let mut tasks = all_tasks.as_array().unwrap().as_slice();
+        let delta = all_delta.as_array_mut().unwrap();
+        let titles: HashMap<_, _> = tasks.iter().map(|t| (t["id"].as_str().unwrap(), &t["title"])).collect();
+        for e in delta.iter_mut() {
+            if let Some(title) = e["task_id"].as_str().and_then(|id| titles.get(id)) {
+                e["task_title"] = (*title).clone();
             }
         }
-    };
+        let mut delta = delta.as_slice();
+        loop {
+            let remaining = tasks.len() + delta.len();
+            let measure = |n: usize| {
+                let t = n.min(tasks.len());
+                let mut request = base.clone();
+                request.payload["report_tasks"] = json!(&tasks[..t]);
+                request.payload["delta"] = json!(&delta[..n - t]);
+                model.measure(request)
+            };
+            let (n, request) = fit_prefix(remaining, |n| {
+                let m = measure(n)?;
+                Ok((n == 1 || m.total <= limit).then_some(m))
+            })?
+            .unwrap();
+            let left = timeout.checked_sub(started.elapsed()).ok_or_else(|| Error::new("报表生成超过总时限"))?;
+            let summary = super::ask(ctx, model, request, left).await?;
+            if n == remaining {
+                return Ok(summary);
+            }
+            base.payload["previous_summary"] = summary;
+            let t = n.min(tasks.len());
+            tasks = &tasks[t..];
+            delta = &delta[n - t..];
+        }
+    }
+    .await;
     if result.as_ref().is_err_and(|e| e.0 == crate::ai::DEFERRED) {
         return Ok(r);
     }

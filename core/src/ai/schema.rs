@@ -193,8 +193,18 @@ fn base_schema(kind: &str) -> Value {
 }
 
 /// Read-only retrieval tools offered when the payload has `_local_context`.
-pub fn context_tools() -> Value {
+pub fn context_tools(kind: &str) -> Value {
     let mut value = json!({"tools":[{"name":"read_context","description":"只读查询获授权的分析上下文（消息/事项/更新流水），可跨来源和会话按id、关键词、来源、会话、类型和时间范围检索；事项按updated时间过滤，来源/会话仅在其全部依据一致时可用，更新流水不支持来源/会话过滤；长文本用next_offset分页续读，每次返回有上限，可重复按需查询；重复页和已读区域不会重复返回，进程受取消和超时控制。","inputSchema":{"type":"object","additionalProperties":false,"properties":{"ids":{"type":"array","items":{"type":"string"}},"query":{"type":"string","maxLength":80},"offset":{"type":"integer","minimum":0},"source":{"type":"string","maxLength":128},"chat":{"type":"string","maxLength":128},"kind":{"type":"string","enum":["message","task","update"]},"since":{"type":"integer"},"until":{"type":"integer"}},"required":[]},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}]});
+    if kind == "archive" {
+        let tool = &mut value["tools"][0];
+        tool["description"] = json!("只读归档补查。用task_number查本批事项的消息(message)或变更(update)，since和until为上海时间对应的毫秒时间戳，默认上次成功归档以来、最多七天。续页只传cursor。");
+        tool["inputSchema"]["properties"] = json!({
+            "task_number":{"type":"integer","minimum":1}, "kind":{"type":"string","enum":["message","update"]},
+            "since":{"type":"integer","minimum":0}, "until":{"type":"integer","minimum":0}, "cursor":{"type":"integer","minimum":1},
+            "ids":{"type":"array","items":{"type":"string","enum":["archived-memory"]}}, "offset":{"type":"integer","minimum":0}
+        });
+        return value;
+    }
     value["tools"][0]["inputSchema"]["properties"]["chat"]["description"] =
         json!("本次输入中的 rooms.id（自动绑定来源），或真实会话编号；不按展示名称匹配");
     value["tools"].as_array_mut().unwrap().push(json!({"name":"read_image","description":"按image_id查看本批相关消息的本地图片，最多2次；只在文字不足时使用。未下载则不可用。","inputSchema":{"type":"object","additionalProperties":false,"properties":{"image_id":{"type":"string","maxLength":512}},"required":["image_id"]},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));

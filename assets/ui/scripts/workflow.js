@@ -29,18 +29,6 @@ function tagHistory() {
     )
     .join('')}</details>`;
 }
-let promptSection = 'history';
-function systemPromptTabs() {
-  return `<div class="pills" role="tablist" aria-label="系统提示词内容" style="margin-bottom:16px"><button role="tab" data-prompt-section="history" aria-selected="${promptSection === 'history'}" class="${promptSection === 'history' ? 'active' : ''}">提示词与版本</button><button role="tab" data-prompt-section="memory" aria-selected="${promptSection === 'memory'}" class="${promptSection === 'memory' ? 'active' : ''}">AI 记忆</button></div>`;
-}
-async function renderSystemPrompts() {
-  renderedKey = viewKey(state, 'settings');
-  if (promptSection !== 'history' && promptHistory) releasePromptHistory();
-  if (promptSection === 'memory') {
-    ++promptRequest;
-    await renderMemory();
-  } else await renderPromptHistory();
-}
 function renderLearning() {
   const rows = [
       ...(state.suggestions || []).filter((r) => !r.archived_at).map((r) => ['rule', r]),
@@ -63,7 +51,7 @@ function renderLearning() {
     done = rows.filter(settled);
   setHtml(
     '#view',
-    `<div class="page advice-page">${reviewTabs()}<div class="box"><header class="settings-section-head"><h2>待确认 ${pending.length} 条</h2>${help('保留历史及手动生成的建议；可预览、启用、拒绝或批复。归档不再修改或自动采用提示词。')}</header><div class="row"><button data-prompt-section="history">提示词与版本</button></div></div>${pending.map(([k, r]) => adviceCard(k, r)).join('') || empty('没有待确认的建议', '继续使用和修正事项，有充分依据时会产生新建议。')}${done.length ? `<details class="box"><summary>已处理 ${done.length} 条 · 下次归档后收起</summary>${done.map(([k, r]) => adviceCard(k, r)).join('')}</details>` : ''}${tagHistory()}</div>`,
+    `<div class="page advice-page">${reviewTabs()}<div class="box"><header class="settings-section-head"><h2>待确认 ${pending.length} 条</h2>${help('保留历史及手动生成的建议；可预览、启用、拒绝或批复。归档不再修改或自动采用提示词。')}</header><div class="row"><button data-settings-target="system-prompts">提示词与版本</button></div></div>${pending.map(([k, r]) => adviceCard(k, r)).join('') || empty('没有待确认的建议', '继续使用和修正事项，有充分依据时会产生新建议。')}${done.length ? `<details class="box"><summary>已处理 ${done.length} 条 · 下次归档后收起</summary>${done.map(([k, r]) => adviceCard(k, r)).join('')}</details>` : ''}${tagHistory()}</div>`,
   );
 }
 let promptTarget = 'classify',
@@ -90,18 +78,11 @@ async function renderPromptHistory() {
   if (!host.querySelector(`[data-prompt-target="${target}"]`)) {
     setHtml(
       host,
-      `<div class="prompt-workspace" data-prompt-target="${esc(target)}">${systemPromptTabs()}<p class="helper">读取系统提示词…</p></div>`,
+      `<div class="prompt-workspace" data-prompt-target="${esc(target)}"><p class="helper">读取系统提示词…</p></div>`,
     );
   }
   const result = await rpc('prompt_history', { target });
-  if (
-    page !== 'settings' ||
-    promptSection !== 'history' ||
-    epoch !== renderEpoch ||
-    request !== promptRequest ||
-    target !== promptTarget
-  )
-    return;
+  if (page !== 'settings' || epoch !== renderEpoch || request !== promptRequest || target !== promptTarget) return;
   rememberPromptDraft();
   promptHistory = result;
   renderPromptWorkspace();
@@ -112,7 +93,7 @@ function renderPromptWorkspace() {
     current = result.current;
   setHtml(
     '#settings-prompt-content',
-    `<div class="prompt-workspace" data-prompt-target="${esc(promptTarget)}">${systemPromptTabs()}<div class="prompt-toolbar"><label>用途 <select id="prompt-target">${Object.entries(
+    `<div class="prompt-workspace" data-prompt-target="${esc(promptTarget)}"><div class="prompt-toolbar"><label>用途 <select id="prompt-target">${Object.entries(
       promptLabels,
     )
       .map(([k, label]) => `<option value="${k}" ${k === promptTarget ? 'selected' : ''}>${label}</option>`)

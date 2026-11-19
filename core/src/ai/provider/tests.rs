@@ -90,6 +90,12 @@ fn api_errors_keep_reference_text() {
     assert!(api_error(&ApiError::simple(ApiErrorKind::InputLimit)).ends_with("：首轮完整请求超过输入额度，未调用模型"));
     let refusal = api_error(&ApiError::simple(ApiErrorKind::Refusal));
     assert!(refusal.starts_with("API 分析失败：") && refusal.ends_with("核对输入范围"), "{refusal}");
+    let mut invalid = ApiError::simple(ApiErrorKind::HttpStatus);
+    invalid.status = Some(400);
+    for param in ["reasoning.effort", "reasoning_effort"] {
+        invalid.parameter = Some(param);
+        assert!(api_error(&invalid).contains("供应商拒绝所选推理强度"));
+    }
 }
 
 #[test]

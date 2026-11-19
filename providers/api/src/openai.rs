@@ -12,7 +12,7 @@
 //! when the provider says it does not support it.
 
 use crate::http_client::{self, HttpError, HttpRequest};
-use crate::json::chars as json_chars;
+use crate::json::{json_words, words};
 use crate::schema_validate::{validate, validate_output, ValidationError};
 use crate::streaming::{ApiEvent, StreamCollector};
 use serde_json::{json, Value};
@@ -64,7 +64,7 @@ pub enum ApiErrorKind {
     HttpStatus,
     #[error("provider response exceeded the size limit")]
     ResponseTooLarge,
-    #[error("initial input exceeded the character budget")]
+    #[error("initial input exceeded the word budget")]
     InputLimit,
     #[error("provider returned no final content")]
     EmptyResponse,
@@ -274,9 +274,9 @@ pub trait ToolHandler {
     fn query_progress(&self, _name: &str) -> Option<usize> {
         None
     }
-    /// Characters of the first request that count against the input limit.
-    fn input_chars(&self, body: &Value, serialized_chars: usize) -> usize {
-        body_input_chars(body, serialized_chars)
+    /// Words of the first request that count against the input limit.
+    fn input_chars(&self, body: &Value) -> usize {
+        body_input_chars(body)
     }
     fn validate_batch(&mut self, _calls: &[ToolInvocation<'_>]) -> Result<(), ToolFailure> {
         Ok(())
@@ -287,18 +287,18 @@ fn image_data_chars(message: &Value) -> usize {
     let parts = message["content"].as_array().into_iter().flatten();
     parts
         .filter_map(|p| p["image_url"]["url"].as_str()?.strip_prefix("data:")?.split_once(";base64,"))
-        .map(|(_, data)| data.len())
+        .map(|(_, data)| words(data))
         .sum()
 }
 
 /// JSON framing of one message; native image pixels have their own limit.
 pub fn message_input_chars(message: &Value) -> usize {
-    json_chars(message).saturating_sub(image_data_chars(message))
+    json_words(message).saturating_sub(image_data_chars(message))
 }
 
 /// A serialized request body without its image pixels.
-pub fn body_input_chars(body: &Value, serialized_chars: usize) -> usize {
-    serialized_chars.saturating_sub(body["messages"].as_array().into_iter().flatten().map(image_data_chars).sum())
+pub fn body_input_chars(body: &Value) -> usize {
+    json_words(body).saturating_sub(body["messages"].as_array().into_iter().flatten().map(image_data_chars).sum())
 }
 
 #[derive(Clone)]
@@ -352,7 +352,7 @@ impl ToolResult {
             }
         }
         let mut text = text.join("\n");
-        if text.len() > MAX_TOOL_RESULT_BYTES || images.iter().map(json_chars).sum::<usize>() > 4 * 1024 * 1024 {
+        if text.len() > MAX_TOOL_RESULT_BYTES || !crate::json::fits_bytes(&images, 4 * 1024 * 1024) {
             return fail(ApiErrorKind::ToolFailed);
         }
         if !images.is_empty() {
@@ -620,9 +620,10 @@ impl ModelRound for Http<'_> {
                 return fail(ApiErrorKind::UnsupportedResponseFormat);
             }
             let param = error["error"]["param"].as_str().unwrap_or("");
-            let parameter = ["model", "reasoning_effort", "response_format", "tools", "messages", "max_tokens"]
-                .into_iter()
-                .find(|p| *p == param);
+            let parameter =
+                ["model", "reasoning_effort", "reasoning.effort", "response_format", "tools", "messages", "max_tokens"]
+                    .into_iter()
+                    .find(|p| *p == param);
             return Err(ApiError {
                 status: Some(response.status),
                 parameter,
@@ -861,9 +862,7 @@ fn run(
             body.as_object_mut().unwrap().retain(|k, _| k != "tools" && k != "tool_choice");
         }
         let text = body.to_string();
-        if std::mem::take(&mut first)
-            && request.input_limit.is_some_and(|l| handler.input_chars(&body, text.chars().count()) > l)
-        {
+        if std::mem::take(&mut first) && request.input_limit.is_some_and(|l| handler.input_chars(&body) > l) {
             return fail(ApiErrorKind::InputLimit);
         }
         event(ApiEvent::Phase("等待首包"));
@@ -895,7 +894,7 @@ fn run(
                 Err(e) => e,
             };
             // One correction: the rejected reply and its error go back to the model.
-            let chars = message_input_chars(&reply.message) + 1;
+            let chars = message_input_chars(&reply.message);
             if revised
                 || rejected.kind == ApiErrorKind::EmptyResponse
                 || limit.is_some_and(|l| chars > l.saturating_sub(used))
@@ -915,7 +914,7 @@ fn run(
         if final_only || reply.tool_calls.iter().any(|(id, ..)| !seen_ids.insert(id.clone())) {
             return fail(ApiErrorKind::NoProgress);
         }
-        let chars = message_input_chars(&reply.message) + 1;
+        let chars = message_input_chars(&reply.message);
         if limit.is_some_and(|l| chars > l.saturating_sub(used)) {
             let reason = "The latest tool proposal exceeded the shared continuation budget. No tools in that reply were executed, and that oversized reply was not added to the conversation.";
             event(ApiEvent::ToolRejected(json!({"response":reply.message,"error":reason,"final_only":true})));
@@ -964,10 +963,7 @@ fn run(
             // Later calls keep room for their minimal wrappers.
             let budget = limit.map(|l| {
                 l.saturating_sub(
-                    used + calls[i + 1..]
-                        .iter()
-                        .map(|c| message_input_chars(&tool_message(&c.0, "")) + 1)
-                        .sum::<usize>(),
+                    used + calls[i + 1..].iter().map(|c| message_input_chars(&tool_message(&c.0, ""))).sum::<usize>(),
                 )
             });
             let call = ToolInvocation { call_id: id, name, arguments };
@@ -989,8 +985,7 @@ fn run(
                 }
                 Ok(Ok((message, parts))) => {
                     let image = (!parts.is_empty()).then(|| json!({"role":"user","content":parts}));
-                    let chars =
-                        message_input_chars(&message) + 1 + image.as_ref().map_or(0, |m| message_input_chars(m) + 1);
+                    let chars = message_input_chars(&message) + image.as_ref().map_or(0, message_input_chars);
                     if budget.is_some_and(|b| chars > b) {
                         final_only = true;
                         Err("The tool result exceeded the shared continuation budget and was not delivered. Do not repeat the operation; use the previously delivered evidence.".into())

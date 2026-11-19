@@ -112,8 +112,8 @@ pub fn check(c: &Config, budget: Result<Option<usize>>) -> Result<()> {
         }
     };
     // The smallest retrieval budget is one `read_context` page.
-    within(c.max_input_chars as u64, 5_000..=200_000, "AI 输入上限应为5000–200000字符")?;
-    within(c.retrieval_budget_chars as u64, 4_000..=1_000_000, "补查预算应为 4000–1000000 字符")?;
+    within(c.max_input_chars as u64, 5_000..=200_000, "AI 输入上限应为5000–200000字")?;
+    within(c.retrieval_budget_chars as u64, 4_000..=1_000_000, "补查预算应为 4000–1000000字")?;
     within(c.analysis_interval_minutes, 1..=1440, "AI 分析间隔应为1–1440分钟")?;
     within(c.analysis_lookback_hours, 1..=87600, "待分析消息时间范围应为1–87600小时")?;
     budget?;

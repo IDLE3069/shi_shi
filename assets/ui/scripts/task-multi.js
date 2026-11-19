@@ -101,20 +101,82 @@ async function runTaskBatch(action, options = {}, items = taskBatchItems()) {
     updateTaskBulkBar();
   }
 }
+const focusList = $('#sidebar-context'),
+  focusDragType = 'application/x-shishi-focus';
+function dropAfter(row, y) {
+  const { top, height } = row.getBoundingClientRect();
+  return y >= top + height / 2;
+}
+focusList.ondragstart = (e) => {
+  const row = e.target.closest('[data-view]');
+  if (!row) return;
+  e.dataTransfer.setData(focusDragType, row.dataset.view);
+  e.dataTransfer.effectAllowed = 'move';
+};
+focusList.ondragover = (e) => {
+  const row = e.target.closest('[data-view]');
+  if (!row || !e.dataTransfer.types.includes(focusDragType)) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  row.dataset.drop = dropAfter(row, e.clientY) ? 'after' : 'before';
+};
+focusList.ondragleave = focusList.ondragend = (e) => {
+  const row = focusList.querySelector('[data-drop]');
+  if (row && !row.contains(e.relatedTarget)) delete row.dataset.drop;
+};
+focusList.ondrop = (e) => {
+  const row = e.target.closest('[data-view]'), id = e.dataTransfer.getData(focusDragType);
+  if (!row || !id) return;
+  e.preventDefault();
+  const after = dropAfter(row, e.clientY);
+  delete row.dataset.drop;
+  if (row.dataset.view !== id)
+    rpc('focus_view_edit', { action: 'move', id, target: row.dataset.view, after })
+      .then(() => refreshState()).catch((error) => toast(error.message));
+};
 document.addEventListener('contextmenu', (event) => {
-  const row = event.target.closest('.task-row[data-task]');
-  if (page !== 'tasks' || !row || !$('#overlay').hidden) return;
+  const row = event.target.closest('.task-row[data-task]'),
+    sidebar = event.target.closest('#sidebar-context');
+  if ((!sidebar && (page !== 'tasks' || !row)) || !$('#overlay').hidden) return;
   event.preventDefault();
   closeTaskContext();
   const menu = document.createElement('div');
   menu.className = 'task-context-menu task-status-menu';
   menu.setAttribute('role', 'menu');
-  const leave = taskMulti.active && !taskMulti.closing;
-  menu.innerHTML = `<button type="button" role="menuitem" ${taskMulti.busy ? 'disabled' : ''}>${leave ? '退出多选' : '多选'}</button>`;
+  if (sidebar) {
+    const item = event.target.closest('[data-view]'),
+      view = item && state.focus_views.find((v) => v.id === item.dataset.view),
+      actions = { add: '新增关注', rename: '修改名称', delete: '删除关注' };
+    menu.innerHTML = (view ? ['add', 'rename', 'delete'] : ['add'])
+      .map((a) => `<button role="menuitem" data-focus-action="${a}">${actions[a]}</button>`).join('');
+    menu.onclick = (e) => {
+      const button = e.target.closest('[data-focus-action]');
+      if (!button) return;
+      const action = button.dataset.focusAction, [, filters] = taskFeedRequest();
+      const parts = [...filters.scope, filters.view, ...Object.values(filters.tag_filters).flat(), ...filters.priorities, filters.query].filter(Boolean);
+      const name = action === 'add' ? (parts.length ? parts.join('、') : '全部事项') : view.name;
+      closeTaskContext();
+      setModal(`<form id="focus-form"><h2>${actions[action]}</h2>${action === 'delete' ? `<p>从关注列表删除“${esc(name)}”？</p>` : `<label>关注名称<input name="name" required value="${esc(name)}"></label>`}<div id="modal-error" class="error-box"></div><div class="dialog-foot"><button type="button" data-action="close">取消</button><button type="submit" class="primary">${action === 'delete' ? '删除' : '保存'}</button></div></form>`);
+      const form = $('#focus-form');
+      if (action !== 'delete') form.elements.name.select();
+      form.onsubmit = (submit) => {
+        submit.preventDefault();
+        const params = action === 'add' ? { action, filters } : { action, id: view.id };
+        if (action !== 'delete') params.name = form.elements.name.value.trim();
+        void modalRequest(form.querySelector('[type="submit"]'), 'focus_view_edit', params, () => {
+          closeModal();
+          return refreshState();
+        }, { lockForm: true });
+      };
+    };
+  } else {
+    const leave = taskMulti.active && !taskMulti.closing;
+    menu.innerHTML = `<button type="button" role="menuitem" ${taskMulti.busy ? 'disabled' : ''}>${leave ? '退出多选' : '多选'}</button>`;
+    menu.querySelector('button').onclick = () => setTaskMulti(!leave, row.dataset.task);
+  }
   document.body.append(menu);
   menu.style.left = `${Math.max(8, Math.min(event.clientX, innerWidth - menu.offsetWidth - 8))}px`;
   menu.style.top = `${Math.max(8, Math.min(event.clientY, innerHeight - menu.offsetHeight - 8))}px`;
-  menu.querySelector('button').onclick = () => setTaskMulti(!leave, row.dataset.task);
   taskContextMenu = menu;
   menu.querySelector('button').focus({ preventScroll: true });
 });

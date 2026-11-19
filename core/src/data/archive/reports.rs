@@ -6,8 +6,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::{audits, in_scope, max_seq, scope_since, scope_sql, status_counts};
-use crate::archive::{new_id, pick, Attempt, Audit, MorningJob, ARCHIVE_CURSOR, REPORT_CURSOR};
+use super::{audits, max_seq, status_counts};
+use crate::archive::{new_id, pick, Attempt, Audit, MorningJob, REPORT_CURSOR};
 use crate::data::{kv, rows};
 use crate::{time, Error, Result};
 
@@ -314,26 +314,45 @@ pub(super) fn detail(conn: &Connection, p: &Value) -> Result<Value> {
     Ok(json!({"revision": revision, "rows": rows, "total": total, "offset": offset, "next_offset": end}))
 }
 
-/// Transaction A of a report: collect the delta since the last summarized
-/// report or archive, whichever came later, and store a pending (or reused)
-/// report. Returns the report with its full rows.
+/// The archive's commit row orders task changes made in the same millisecond.
 pub(crate) fn prepare(conn: &Connection, label: &str, at: i64) -> Result<Value> {
-    let since = scope_since(conn)?;
-    let cursor = kv::get_i64(conn, REPORT_CURSOR)?.max(kv::get_i64(conn, ARCHIVE_CURSOR)?);
-    let delta = audits(conn, &format!("seq > {cursor} AND {} ORDER BY seq", in_scope(since)))?;
+    let oldest = at - 7 * time::DAY;
+    let until = max_seq(conn)?;
+    let (finished, archive_seq): (i64, i64) = conn.query_row(
+        "SELECT coalesce(max(x.time), max(a.finished), 0), coalesce(max(x.seq), ?2)
+         FROM (SELECT finished, report_id FROM archive_attempts WHERE status = 'succeeded' AND finished >= ?1
+               ORDER BY finished DESC LIMIT 1) a
+         LEFT JOIN task_audit x ON x.task_id = '' AND x.time >= ?1 AND x.kind IN ('archive_commit', 'archive_reuse')
+           AND json_extract(x.after, '$.report') = a.report_id",
+        params![oldest, until],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let scope = format!(
+        "merged_into = '' AND generation = '' AND
+         (archived = 0 OR archived_at >= {oldest} AND (archived_at, (SELECT max(seq) FROM task_audit x
+            WHERE x.task_id = tasks.id AND x.kind IN ('manual_archive', 'archive_item'))) > ({finished}, {archive_seq}))"
+    );
+    let reported = kv::get_i64(conn, REPORT_CURSOR)?;
+    let delta = audits(
+        conn,
+        &format!(
+            "seq > {reported} AND time >= {oldest} AND (time, seq) > ({finished}, {archive_seq})
+             AND task_id IN (SELECT id FROM tasks WHERE {scope}) ORDER BY seq"
+        ),
+    )?;
     let previous = first_report(conn)?;
     let mut r = json!({
         "id": new_id(),
         "previous_report": previous.as_ref().map(|p| json!({"id": p["id"], "time": p["time"], "label": p["label"]})),
         "delta": delta.iter().map(Audit::change).collect::<Vec<_>>(),
-        "audit_until": max_seq(conn)?,
+        "audit_until": until,
         "suggestions": crate::data::rules::list(conn)?,
         "time": at,
         "label": label,
         "date": time::date_from(at),
         "data_until": kv::get_i64(conn, "last_scan")?,
         "pending_analysis": crate::data::analysis::unanalyzed(conn)?,
-        "tasks": crate::data::tasks::list(conn, &scope_sql(since))?.iter().map(|t| t.payload()).collect::<Vec<_>>(),
+        "tasks": crate::data::tasks::list(conn, &scope)?.iter().map(|t| t.payload()).collect::<Vec<_>>(),
         "status_counts": status_counts(conn)?,
     });
     let reuse = previous.filter(|old| {

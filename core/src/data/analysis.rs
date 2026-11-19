@@ -60,7 +60,7 @@ pub fn pending_rows(conn: &Connection, config: &Config) -> Result<Vec<Row>> {
         "SELECT m.id, m.content_hash, m.time, m.updated_at, \
          CASE WHEN m.error_hash = m.content_hash THEN m.error_count ELSE 0 END AS errors, \
          CASE WHEN m.error_hash = m.content_hash THEN coalesce(m.retry_reason, '') ELSE '' END, \
-         min(length(m.text), {BODY_CHARS}) \
+         word_count(substr(m.text, 1, {BODY_CHARS})) \
          FROM messages m WHERE {} ORDER BY errors, m.updated_at, m.time, m.id",
         pending_where(config)
     );
@@ -104,7 +104,7 @@ fn pending_stats(
     let sql = format!(
         "SELECT count(*), \
          coalesce(sum(NOT EXISTS (SELECT 1 FROM json_each(?2) a WHERE a.key = m.id AND a.value = m.content_hash)), 0), \
-         coalesce(sum(min(length(m.text), {BODY_CHARS}) + {ROW_OVERHEAD}), 0) \
+         coalesce(sum(word_count(substr(m.text, 1, {BODY_CHARS})) + {ROW_OVERHEAD}), 0) \
          FROM messages m WHERE {} AND (?3 IS NULL OR m.id IN (SELECT value FROM json_each(?3)))",
         pending_where(config)
     );
@@ -521,7 +521,7 @@ fn candidates(conn: &Connection, ids: &[String], limit: usize) -> Result<Vec<Mes
     let mut bound = 0usize;
     for id in ids {
         let Some(m) = super::messages::get(conn, id)? else { continue };
-        bound += m.text.chars().take(BODY_CHARS).count() + progress::ROW_OVERHEAD;
+        bound += m.text.chars().take(BODY_CHARS).filter(|c| c.is_alphanumeric()).count() + progress::ROW_OVERHEAD;
         out.push(m);
         if bound > limit {
             break;

@@ -193,7 +193,8 @@ const date = (t) =>
 let state = null,
   page = 'tasks',
   selected = '',
-  tab = '待处理',
+  taskScopes = ['待处理'],
+  activeFocus = null,
   query = '',
   inboxQuery = '',
   settingsDirty = false,
@@ -486,7 +487,7 @@ function viewKey(s, p) {
     case 'tools':
       return JSON.stringify(s.config.tools);
     case 'settings':
-      return JSON.stringify([promptSection, promptSection === 'memory' ? s.memory_state : s.prompt_state]);
+      return JSON.stringify([s.prompt_state, s.memory_state]);
     default:
       return '';
   }
@@ -558,7 +559,14 @@ window.refreshState = function (force = false) {
             scroll = $('#view').scrollTop;
           await render(nextKey);
           if (page === target) $('#view').scrollTop = scroll;
-        } else if (page === 'settings' && renderedPage === page && changed) await renderSystemPrompts();
+        } else if (page === 'settings' && renderedPage === page && changed) {
+          const [prompts, memory] = renderedKey ? JSON.parse(renderedKey) : [];
+          renderedKey = nextKey;
+          await Promise.all([
+            JSON.stringify(prompts) !== JSON.stringify(state.prompt_state) && renderPromptHistory(),
+            JSON.stringify(memory) !== JSON.stringify(state.memory_state) && renderMemory(),
+          ]);
+        }
         if (!uiReady) {
           uiReady = true;
           await rpc('ui_ready');
@@ -614,14 +622,3 @@ async function leaveSettings() {
   settingsDirty = false;
   return true;
 }
-
-const effortNames = {
-  none: '无',
-  minimal: '最少',
-  low: '低',
-  medium: '中',
-  high: '高',
-  xhigh: '很高',
-  max: '最高',
-  ultra: '超高',
-};

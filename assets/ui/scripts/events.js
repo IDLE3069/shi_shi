@@ -47,9 +47,22 @@ document.addEventListener('click', async (e) => {
     }
     if (b.dataset.view && !(await leaveSettings())) return;
     if (b.dataset.view) {
+      const view = state.focus_views.find((v) => v.id === b.dataset.view);
       page = 'tasks';
-      tab = taskFocusViews[b.dataset.view] || '全部';
-      quickView = taskFocusViews[b.dataset.view] ? '' : b.dataset.view;
+      if (view.filters) {
+        const f = structuredClone(view.filters);
+        taskScopes = f.scope;
+        quickView = f.view;
+        query = f.query;
+        const changed = JSON.stringify([tagSelection(), prioritySelection()]) !== JSON.stringify([f.tag_filters, f.priorities]);
+        selectedTags = f.tag_filters;
+        selectedPriorities = f.priorities;
+        if (changed) saveTagFilters();
+      } else {
+        taskScopes = [view.id];
+        quickView = '';
+      }
+      renderFocusViews(view.id);
       render();
       return;
     }
@@ -65,7 +78,8 @@ document.addEventListener('click', async (e) => {
       return;
     }
     if (b.dataset.tab) {
-      tab = tab === b.dataset.tab ? '全部' : b.dataset.tab;
+      const scope = b.dataset.tab;
+      taskScopes = taskScopes.includes(scope) ? taskScopes.filter((s) => s !== scope) : [...taskScopes, scope];
       quickView = '';
       renderTasks();
       return;
@@ -262,7 +276,7 @@ document.addEventListener('click', async (e) => {
         await modalRequest(b, 'generate', { text, sources: manualSources }, async (draft) => {
           closeModal();
           page = 'tasks';
-          tab = '待处理';
+          taskScopes = ['待处理'];
           quickView = '';
           selected = draft.id;
           await refreshState(true);

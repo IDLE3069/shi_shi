@@ -85,6 +85,7 @@ pub struct Job {
     pub kind: String,
     pub route: Route,
     pub config: Arc<Config>,
+    pub input_limit: Option<usize>,
     pub prepared: Prepared,
     /// Registered SS tools of this request.
     pub session: Option<Session>,
@@ -217,7 +218,7 @@ impl ToolHandler for Tools<'_, '_> {
         context.read(
             call.name,
             call.arguments,
-            budget.map(|remaining| remaining.saturating_sub(message_input_chars(&empty) + 1)),
+            budget.map(|remaining| remaining.saturating_sub(message_input_chars(&empty))),
         )
     }
 
@@ -240,13 +241,13 @@ impl ToolHandler for Tools<'_, '_> {
         RETRIEVAL.contains(&name).then(|| self.context.as_deref().map_or(0, Context::progress))
     }
 
-    fn input_chars(&self, body: &Value, serialized_chars: usize) -> usize {
+    fn input_chars(&self, body: &Value) -> usize {
         // Query images are credited by the loop; their pixels are bounded
         // separately and never use the text allowance.
         if self.native {
             super::native::body_input_chars(&self.job.prepared.schema, body)
         } else {
-            body_input_chars(body, serialized_chars)
+            body_input_chars(body)
         }
     }
 
@@ -315,7 +316,7 @@ pub fn tool_loop(
         timeout: job.timeout(),
         tools: &prepared.definitions,
         tool_handler: &mut handler,
-        input_limit: Some(job.config.max_input_chars),
+        input_limit: job.input_limit,
         continuation_limit: Some(job.config.retrieval_budget_chars),
     };
     let trace = job.trace.as_ref();
@@ -372,6 +373,11 @@ pub fn api_error(e: &ApiError) -> String {
         (ApiErrorKind::Cancelled, _) => return super::CANCELLED.into(),
         (ApiErrorKind::InputLimit, _) => {
             return format!("{}：首轮完整请求超过输入额度，未调用模型", super::INPUT_LIMIT_ERROR)
+        }
+        (ApiErrorKind::HttpStatus, Some(400 | 422))
+            if matches!(e.parameter, Some("reasoning_effort" | "reasoning.effort")) =>
+        {
+            "；供应商拒绝所选推理强度，请在设置中为该模型选择其他强度"
         }
         (ApiErrorKind::HttpStatus, Some(400 | 422)) => {
             "；供应商拒绝请求参数，请核对模型、推理强度、工具及结构化输出支持。未自动丢弃参数，未应用本次结果"

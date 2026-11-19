@@ -2,12 +2,13 @@
 //! of the work area. They show without taking focus.
 use super::{window::SOLID, UiEvent};
 use crate::notices::{Notice, Queue};
+use crate::placement;
 use serde_json::{json, Value};
 use std::time::Instant;
 use tao::{
-    dpi::{LogicalSize, PhysicalPosition},
+    dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
     event_loop::{EventLoopProxy, EventLoopWindowTarget},
-    platform::windows::{WindowBuilderExtWindows, WindowExtWindows},
+    platform::windows::{MonitorHandleExtWindows, WindowBuilderExtWindows, WindowExtWindows},
     window::{Theme, Window, WindowBuilder, WindowId},
 };
 use wry::{WebContext, WebView, WebViewBuilderExtWindows};
@@ -153,32 +154,34 @@ impl Surface {
     /// window yet (a tray-only start), on the primary monitor.
     pub fn refresh(&mut self, queue: &mut Queue, anchor: Option<&Window>) {
         use windows_sys::Win32::{
-            Foundation::POINT,
-            Graphics::Gdi::{
-                GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-                MONITOR_DEFAULTTOPRIMARY,
+            Graphics::Gdi::{GetMonitorInfoW, MONITORINFO},
+            UI::WindowsAndMessaging::{
+                SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
             },
-            UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE},
         };
-        let monitor = match anchor {
-            Some(a) => unsafe { MonitorFromWindow(a.hwnd() as _, MONITOR_DEFAULTTONEAREST) },
-            None => unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) },
-        };
-        let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
-        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+        if queue.count() == 0 && self.windows.iter().all(|t| t.last.is_none()) {
             return;
         }
-        let Some(scale) = anchor.or(self.windows.first().map(|t| &t.window)).map(Window::scale_factor) else { return };
-        let gap = (10. * scale).round() as i32;
-        let height = (HEIGHT * scale).round() as i32;
-        let capacity = ((info.rcWork.bottom - info.rcWork.top - gap) / (height + gap)).max(1) as usize;
+        let monitor = match anchor {
+            Some(window) => window.current_monitor(),
+            None => self.windows.first().and_then(|t| t.window.primary_monitor()),
+        };
+        let Some(monitor) = monitor else { return };
+        let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if unsafe { GetMonitorInfoW(monitor.hmonitor() as _, &mut info) } == 0 {
+            return;
+        }
+        let scale = monitor.scale_factor();
+        let slots: [_; MAX_VISIBLE] =
+            std::array::from_fn(|i| placement::notice_slot(info.rcWork.into(), (WIDTH, HEIGHT), scale, i));
         let at = Instant::now();
-        let rows = queue.active(at, capacity.min(self.windows.len()));
-        let mut bottom = info.rcWork.bottom - gap;
+        let rows = queue.active(at, slots[..self.windows.len()].iter().flatten().count());
         for (index, t) in self.windows.iter_mut().enumerate() {
             let Some(row) = rows.get(index).filter(|_| t.ready) else {
-                unsafe { ShowWindow(t.window.hwnd() as _, SW_HIDE) };
+                if t.window.is_visible() {
+                    unsafe { ShowWindow(t.window.hwnd() as _, SW_HIDE) };
+                }
                 if rows.get(index).is_none() {
                     t.last = None;
                 }
@@ -188,20 +191,28 @@ impl Surface {
                 let _ = t.webview.evaluate_script(&format!("window.setNotice({})", json!(row)));
                 t.last = Some(row.clone());
             }
-            let size = t.window.outer_size();
-            let position = PhysicalPosition::new(
-                (info.rcWork.right - size.width as i32 - gap).max(info.rcWork.left),
-                (bottom - size.height as i32).max(info.rcWork.top),
-            );
-            if t.window.outer_position().ok() != Some(position) {
-                t.window.set_outer_position(position);
+            let slot = slots[index].unwrap();
+            let (width, height) = (slot.right - slot.left, slot.bottom - slot.top);
+            if t.window.outer_position().ok() != Some(PhysicalPosition::new(slot.left, slot.top))
+                || t.window.outer_size() != PhysicalSize::new(width as u32, height as u32)
+            {
+                unsafe {
+                    SetWindowPos(
+                        t.window.hwnd() as _,
+                        std::ptr::null_mut(),
+                        slot.left,
+                        slot.top,
+                        width,
+                        height,
+                        SWP_NOACTIVATE | SWP_NOZORDER,
+                    )
+                };
             }
             t.round_corners();
             if !t.window.is_visible() {
                 unsafe { ShowWindow(t.window.hwnd() as _, SW_SHOWNOACTIVATE) };
             }
             queue.shown(&row.id, at);
-            bottom -= size.height as i32 + gap;
         }
     }
 }

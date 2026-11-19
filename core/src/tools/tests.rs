@@ -375,16 +375,15 @@ fn trimmed_results_share_space_count_escapes_and_keep_metadata() {
         stderr: "错".repeat(30),
         ..Default::default()
     };
-    let whole = tool_result_text(full.clone(), 100_000, true).unwrap();
+    let whole = tool_result_text(full.clone(), 100_000).unwrap();
     assert_eq!(serde_json::from_str::<CommandResult>(&whole).unwrap(), full);
-    let cut = tool_result_text(full.clone(), 600, true).unwrap();
-    let escaped: usize = serde_json::to_string(&cut).unwrap().chars().count() - 2;
-    assert!(escaped <= 600, "{escaped}");
+    let cut = tool_result_text(full.clone(), 600).unwrap();
+    assert!(shishi_api::json::words(&cut) <= 600);
     let r: CommandResult = serde_json::from_str(&cut).unwrap();
     assert!(r.truncated && full.stdout.starts_with(&r.stdout) && full.stderr.starts_with(&r.stderr));
     assert!(!r.stderr.is_empty(), "stderr keeps a share");
     assert_eq!((r.status.as_str(), r.exit_code), ("completed", Some(0)));
-    assert!(tool_result_text(full, 40, true).is_none());
+    assert!(tool_result_text(full, 40).is_none());
 }
 
 #[tokio::test]

@@ -10,6 +10,7 @@ async function renderSettings() {
     ['prompts', '判断规则'],
     ['sources', '消息来源'],
     ['system-prompts', '系统提示词'],
+    ['memory', 'AI记忆'],
     ['storage', '数据设置'],
     ['about', '关于我们'],
   ];
@@ -29,8 +30,8 @@ async function renderSettings() {
  <div class="compact-setting-row">${toggle('cfg-ai', '自动分析', c.auto_ai, '到达分析间隔或有效输入预算的 80% 时分析，没有消息不调用。')}${number('cfg-analysis-interval', '分析间隔', c.analysis_interval_minutes, 1, 1440, '分钟')}${toggle('cfg-message-filter', '可提前触发', c.message_filter_enabled, '自动分析开启时，由独立模型判断新消息是否需要提前分析；不删除消息、不推进分析进度。关闭上级时暂停，保留原选择。')}</div>
  <div class="compact-setting-row">${toggle('cfg-analysis-related', '仅分析相关消息', c.analysis_related_only, '开启：仅分析私聊、你发送或被 @ 的消息，以及已有事项关联会话中的消息。关闭：分析全部增量消息。')}</div>
  <div class="compact-setting-row automation-limits">${number('cfg-analysis-lookback', '积压消息保留', c.analysis_lookback_hours, 1, 87600, '小时', '只分析此时间范围内的积压消息；更早消息仍可补查，原始消息按数据保留期限清理。')}${number('cfg-ai-timeout', 'AI调用超时', c.ai_timeout_seconds, 30, 1800, '秒', 'Codex、DSH、API 的分析请求共用。包含工具调用及格式纠正；上游网关仍可能提前超时。')}</div>
- </div><div class="automation-side"><div class="automation-usage">${head('用量保护', '消息按输入预算分批；超限时缩减消息和事项，仍超限则暂停自动分析等待处理。字符数不等于 tokens。')}
- <div class="compact-setting-row">${number('cfg-budget', '每日调用', c.daily_calls, 0, 500, '次', '0 表示暂停受此额度限制的 AI 调用；过滤用量单列。')}${number('cfg-input-limit', '单次输入', c.max_input_chars, 5000, 200000, '字符')}${number('cfg-context-limit', '续轮累计上限', c.retrieval_budget_chars, 4000, 1000000, '字符', '补查结果、命令结果和模型续轮附文共用此额度，与首轮输入分开计算。额度不足时告知 AI 调整或基于已有资料完成；纠错提示不计入。')}</div></div>
+ </div><div class="automation-side"><div class="automation-usage">${head('用量保护', '消息按输入预算分批；超限时缩减消息和事项，仍超限则暂停自动分析等待处理。汉字、字母和数字各算1字。')}
+ <div class="compact-setting-row">${number('cfg-budget', '每日调用', c.daily_calls, 0, 500, '次', '0 表示暂停受此额度限制的 AI 调用；过滤用量单列。')}${number('cfg-input-limit', '单次输入', c.max_input_chars, 5000, 200000, '字', '汉字、字母和数字各算1字，标点和空白不计。')}${number('cfg-context-limit', '续轮累计上限', c.retrieval_budget_chars, 4000, 1000000, '字', '补查结果、命令结果和模型续轮附文共用此额度，与首轮输入分开计算。额度不足时告知 AI 调整或基于已有资料完成；纠错提示不计入。')}</div></div>
  <div class="automation-work">${head('工作时间', '上班生成早报，下班汇总并归档。支持跨夜；忙碌时排队，重启后未完成归档记为失败，等待手动处理。错过时点不补跑。日历与加班可在顶部工作状态调整。')}
  <div class="compact-setting-row work-times"><label>上班 <input id="cfg-work-start" type="time" value="${esc(c.work_start)}"></label><label>下班 <input id="cfg-work-end" type="time" value="${esc(c.work_end)}"></label></div></div></div></div>
  <div class="automation-extras">${toggle('cfg-traces', '保留完整 AI 跟踪', c.retain_ai_traces, '保存 AI 输入、输出、事件和错误正文，可能包含私人内容。消息会发送到所选 AI 服务；消息清理不会清除服务端会话。')}</div></section>
@@ -39,6 +40,7 @@ async function renderSettings() {
  <section class="settings-card" id="settings-prompts">${head('判断规则')}<div class="form-group"><label for="cfg-leaders">重点关注人员${help('每行一个姓名，提高关注度，不直接判为紧急。')}</label><textarea id="cfg-leaders" rows="2" placeholder="可留空">${esc(c.leaders.join('\n'))}</textarea></div></section></div>
  <section class="settings-card settings-sources" id="settings-sources">${head('消息来源')}<div id="settings-source-content" data-preserve-content><p class="helper">正在读取消息来源…</p></div></section>
  <section class="settings-card" id="settings-system-prompts">${head('系统提示词')}<div id="settings-prompt-content" data-preserve-content></div></section>
+ <section class="settings-card" id="settings-memory">${head('AI记忆', '记忆保存在本地，保存后供后续AI请求使用。')}<div id="settings-memory-content" class="memory-page" data-preserve-content><p class="helper">读取AI记忆…</p></div></section>
  <section class="settings-card" id="settings-storage">${head('数据设置', '配置、事项、消息、插件和日志保存在数据目录；更改目录后自动重启。')}<div class="data-settings-row"><div class="data-directory"><span class="setting-label">数据目录</span><div class="settings-path" tabindex="0" title="${esc(state.data_directory)}">${esc(state.data_directory)}</div><button data-action="open-data">打开目录</button><button data-storage-change>更改目录</button></div>${number('cfg-retention', '保留期限', c.message_retention_days, 1, 3650, '天', '过期消息和旧操作记录清理后不可补查；未分析消息也会过期。未归档事项及仍被引用的材料保留，报表和提示词历史单独保留。')}</div>${retentionSummary()}</section>
  ${aboutSection()}</main></div>`,
   );
@@ -48,7 +50,7 @@ async function renderSettings() {
   settingsBaseline = readSettingsValues();
   syncUpdateControls();
   void renderSources();
-  await renderSystemPrompts().catch((e) => {
+  await Promise.all([renderPromptHistory(), renderMemory()]).catch((e) => {
     renderedKey = '';
     toast(e.message);
   });

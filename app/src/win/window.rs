@@ -303,9 +303,6 @@ pub fn run(owner: Arc<Owner>) -> Result<(), String> {
                 if view.as_ref().is_some_and(|v| !v.ready && Instant::now() >= v.deadline) {
                     crate::fail(STARTUP_STALLED, Some(&owner.data), gui());
                 }
-                if let Some(s) = surface.as_mut() {
-                    s.refresh(&mut queue, view.as_ref().map(|v| &v.window));
-                }
                 if !ticking && !stopping && now() >= updates.next_wake(now(), enabled()) {
                     ticking = true;
                     let (updates, proxy, on) = (updates.clone(), proxy.clone(), enabled());
@@ -435,7 +432,6 @@ pub fn run(owner: Arc<Owner>) -> Result<(), String> {
                     {
                         queue.dismiss();
                     }
-                    s.refresh(&mut queue, view.as_ref().map(|v| &v.window));
                 }
             }
             Event::UserEvent(UiEvent::Stopped { restart }) => {
@@ -460,15 +456,9 @@ pub fn run(owner: Arc<Owner>) -> Result<(), String> {
                             }
                         }
                     }
-                    s.refresh(&mut queue, view.as_ref().map(|v| &v.window));
                 }
             }
-            Event::UserEvent(UiEvent::NoticeOpened(id)) => {
-                queue.dismiss_task(&id);
-                if let Some(s) = surface.as_mut() {
-                    s.refresh(&mut queue, view.as_ref().map(|v| &v.window));
-                }
-            }
+            Event::UserEvent(UiEvent::NoticeOpened(id)) => queue.dismiss_task(&id),
             Event::UserEvent(UiEvent::Tray(tray::Action::Panel)) => {
                 if panel.is_none() {
                     match panel::Panel::create(
@@ -522,7 +512,6 @@ pub fn run(owner: Arc<Owner>) -> Result<(), String> {
             {
                 if let Some(s) = surface.as_mut() {
                     s.close(window_id, &mut queue);
-                    s.refresh(&mut queue, view.as_ref().map(|v| &v.window));
                 }
             }
             Event::WindowEvent { window_id, event: WindowEvent::CloseRequested, .. } => {
@@ -540,6 +529,11 @@ pub fn run(owner: Arc<Owner>) -> Result<(), String> {
                         v.window.set_background_color(Some(SOLID));
                         backdrop::clear(v.hwnd);
                     }
+                }
+            }
+            Event::MainEventsCleared => {
+                if let Some(s) = surface.as_mut() {
+                    s.refresh(&mut queue, view.as_ref().map(|v| &v.window));
                 }
             }
             _ => {}

@@ -178,13 +178,7 @@ fn place(target: &EventLoopWindowTarget<UiEvent>, at: PhysicalPosition<f64>) -> 
     if unsafe { GetMonitorInfoW(monitor.hmonitor() as _, &mut info) } == 0 {
         return None;
     }
-    let rect = |r: windows_sys::Win32::Foundation::RECT| placement::Rect {
-        left: r.left,
-        top: r.top,
-        right: r.right,
-        bottom: r.bottom,
-    };
     let (x, y) = (at.x as i32, at.y as i32);
     let anchor = placement::Rect { left: x, top: y, right: x + 1, bottom: y + 1 };
-    Some(placement::place(rect(info.rcMonitor), rect(info.rcWork), anchor, SIZE, monitor.scale_factor()))
+    Some(placement::place(info.rcMonitor.into(), info.rcWork.into(), anchor, SIZE, monitor.scale_factor()))
 }

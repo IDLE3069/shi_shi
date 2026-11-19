@@ -63,11 +63,11 @@ impl Db {
             let max_input = config.max_input_chars;
             let live = trim(c, &mut queue, true)?;
             let mut picked = Picked { queue: VecDeque::new(), rows: Vec::new(), versions: Vec::new(), bounded: false };
-            let mut chars = 2usize;
+            let mut chars = 0usize;
             for (id, hash) in queue.iter().filter(|(id, hash)| live.get(id) == Some(hash)) {
                 let Some(message) = crate::data::messages::get(c, id)? else { continue };
                 let value = batch::message(&message, filter::BODY_CHARS);
-                let size = batch::chars(&value) + usize::from(!picked.rows.is_empty());
+                let size = shishi_api::json::json_words(&value);
                 if !picked.rows.is_empty() && chars.saturating_add(size) > max_input {
                     picked.bounded = true;
                     break;

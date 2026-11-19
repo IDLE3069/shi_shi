@@ -28,6 +28,26 @@ fn other_edges_and_scales_follow_the_taskbar() {
 }
 
 #[test]
+fn existing_notices_follow_the_work_area_and_scale_on_reconnect() {
+    let local = Rect { bottom: 1032, ..MONITOR };
+    let remote = Rect { left: -3840, top: 0, right: 0, bottom: 2088 };
+    for (work, scale, width, height, gap) in
+        [(local, 1., 320, 140, 10), (remote, 1.5, 480, 210, 15), (remote, 2., 640, 280, 20), (local, 1., 320, 140, 10)]
+    {
+        let mut bottom = work.bottom - gap;
+        for index in 0..3 {
+            let r = notice_slot(work, (320., 140.), scale, index).unwrap();
+            assert_eq!((r.right, r.bottom), (work.right - gap, bottom));
+            assert_eq!((r.right - r.left, r.bottom - r.top), (width, height));
+            bottom = r.top - gap;
+        }
+    }
+    let small = Rect { left: 0, top: 0, right: 300, bottom: 230 };
+    assert_eq!(notice_slot(small, (320., 140.), 2., 0), Some(Rect { left: 20, top: 20, right: 280, bottom: 210 }));
+    assert_eq!(notice_slot(small, (320., 140.), 2., 1), None);
+}
+
+#[test]
 fn an_auto_hidden_taskbar_uses_the_edge_nearest_the_click_and_a_small_screen_shrinks() {
     assert_eq!(edge(MONITOR, MONITOR, at(1900, 600)), Edge::Right);
     assert_eq!(edge(MONITOR, MONITOR, at(900, 1075)), Edge::Bottom);

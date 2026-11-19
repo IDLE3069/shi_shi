@@ -173,8 +173,8 @@ async fn run(
         let total = request.total;
         request.request.payload["_batch_metrics"] = json!({
             "index": index, "pending": pending, "selected": selected, "remaining": boundary.len(),
-            "initial_selected": rows.len(), "message_chars": batch::chars(&json!(&rows[..selected])),
-            "total_input_chars": total, "max_input_chars": max_input,
+            "initial_selected": rows.len(), "message_chars": shishi_api::json::json_words(&json!(&rows[..selected])),
+            "unit": "words", "total_input_chars": total, "max_input_chars": max_input,
             "reduced_by": if bounded || selected < rows.len() { vec!["input_budget"] } else { vec![] },
         });
         if index > 1 {

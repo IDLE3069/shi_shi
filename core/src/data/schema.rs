@@ -42,6 +42,10 @@ fn functions(conn: &Connection) -> Result<()> {
         },
     )?;
     conn.create_scalar_function(
+        "word_count", 1, FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| Ok(shishi_api::json::words(ctx.get_raw(0).as_str()?) as i64),
+    )?;
+    conn.create_scalar_function(
         "audit_matches",
         8,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
